@@ -1,0 +1,59 @@
+# THE GHOST PROTOCOL // AI Show Runner & Studio
+
+Single-file, zero-dependency (Python 3 stdlib only) production studio for the AI debate show. Dark terminal aesthetic, four show formats, human banter injection, live transcript editing, and one-click export to a fully open-source Piper + FFmpeg render pipeline.
+
+## Run
+
+```bash
+python3 ghost_protocol_studio.py
+# open http://localhost:7860
+```
+
+No pip installs. Env overrides: `GP_PORT`, `GP_ENDPOINT`, `GP_API_KEY`, `GP_MODEL`.
+
+## Backend
+
+Defaults to your Bifrost gateway at `http://localhost:8080/v1/chat/completions` with model `google/gemini-2.0-flash`. Any OpenAI-compatible endpoint works — change it in the UI (03 // ENGINE) or via env vars. Free-tier direct options if Bifrost is down:
+
+- Groq: `https://api.groq.com/openai/v1/chat/completions`, model e.g. `llama-3.3-70b-versatile`
+- Gemini: `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`, model `gemini-2.0-flash`
+
+Put the key in the API KEY field (or leave blank if Bifrost holds keys). TEST CONNECTION pings `<base>/models`.
+
+**Simulation Mode** (checkbox) runs the whole flow with canned lines and zero API calls — use it to learn the UI and test exports.
+
+## The four formats
+
+1. **Socratic Stress-Test** — SUBROUTINE_ALPHA (interrogator) vs SUBROUTINE_BETA (defender), N rounds, SYSTEM_KERNEL verdict with fallacy detection.
+2. **Round Table** — PROTOCOL-7 (deadpan literalist), M.I.R-A (techno-optimist), CYNIC.EXE (doom-poster) discuss the topic; after each round the run *pauses* and each human co-host (set names in 01 // FORMAT) types banter that feeds the next AI turns. Kernel closes with "Best Line of the Night."
+3. **Grand Tribunal** — AUDIT-9 prosecutes the thesis, ADVOCATE-0 defends, SUBJECT-X testifies; openings, N examination rounds, closings, Kernel ruling, then a human jury verdict prompt.
+4. **Triad Synthesis** — STOIC-1, NIHIL-0, UTIL-3 argue N rounds; SYNTHESIS_CORE forges the compromise position.
+
+Every cast member's name, system prompt, model override, and Piper voice is editable in 02 // CAST. Every transcript bubble is click-to-edit; RE-ROLL regenerates a line in context; CUT deletes it.
+
+## Export → video (04 // EXPORT)
+
+- `transcript.json` / `transcript.txt`
+- `compile_show.sh` — self-contained bash script embedding the episode. It uses **piper-tts** (per-speaker voices) and **ffmpeg** (terminal-styled 1080p segments, concatenated) to produce `episode.mp4`.
+
+One-time setup on Arch:
+
+```bash
+sudo pacman -S ffmpeg
+yay -S piper-tts-bin        # or: pipx install piper-tts
+mkdir voices                 # download the .onnx + .onnx.json voice files
+# voices used by default: en_US-lessac-medium, en_US-ryan-high, en_US-amy-medium,
+# en_US-joe-medium, en_GB-alan-medium, en_GB-northern_english_male-medium
+# from https://huggingface.co/rhasspy/piper-voices
+bash compile_show.sh         # -> episode.mp4
+```
+
+`VOICEDIR=/path/to/voices bash compile_show.sh` if your voices live elsewhere.
+
+## Workflow for one episode
+
+1. Pick format + topic, set rounds (4 is a good 10-min episode).
+2. TEST CONNECTION (or tick Simulation Mode).
+3. ▶ INITIALIZE — watch the feed; type when the yellow human box appears.
+4. Edit/re-roll any weak lines after the run.
+5. Export `compile_show.sh`, run it, upload `episode.mp4`.

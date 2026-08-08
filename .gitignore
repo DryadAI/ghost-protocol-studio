@@ -1,0 +1,6 @@
+__pycache__/
+build/
+voices/
+*.wav
+*.mp4
+nohup.out
