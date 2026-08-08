@@ -36,6 +36,18 @@ PORTRAIT_SIZE = 640
 FPS = 25
 TEXT_BOX = "box=1:boxcolor=0x0a0e14@0.55:boxborderw=10"
 
+TOPICS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "topics.json")
+try:
+    with open(TOPICS_FILE, encoding="utf-8") as _f:
+        TOPICS = json.load(_f)
+except Exception:  # noqa: BLE001 — file optional; ship a tiny fallback bank
+    TOPICS = [
+        {"t": "An AI that perfectly simulates human consciousness is legally and morally a person.", "cat": "serious"},
+        {"t": "Democracy should be replaced by an unbiased, data-driven AI optimized for human flourishing.", "cat": "serious"},
+        {"t": "A hot dog is a sandwich, and cereal is a soup.", "cat": "absurd"},
+        {"t": "Birds would owe humanity rent if they understood property law.", "cat": "absurd"},
+    ]
+
 
 def proxy_chat(body: dict) -> dict:
     """Forward one chat completion to the configured OpenAI-compatible endpoint."""
@@ -277,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", HTML.encode("utf-8"))
+        elif self.path == "/api/topics":
+            self._send(200, "application/json", json.dumps(TOPICS).encode("utf-8"))
         elif self.path == "/api/defaults":
             self._send(200, "application/json", json.dumps({
                 "endpoint": DEFAULT_ENDPOINT, "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL,
@@ -444,6 +458,14 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
         <option value="triad">Triad Synthesis (3 schools collide)</option>
       </select>
       <label>TOPIC / THESIS</label>
+      <div class="row" style="margin-bottom:6px">
+        <select id="dicePool" style="flex:1.4">
+          <option value="any">DICE POOL: ANY</option>
+          <option value="serious">DICE POOL: SERIOUS</option>
+          <option value="absurd">DICE POOL: ABSURD</option>
+        </select>
+        <button class="b" id="btnRoll" style="flex:1" onclick="rollTopic()" title="random topic">⚄ ROLL</button>
+      </div>
       <textarea id="topic">An AI that perfectly simulates human consciousness is legally and morally a person.</textarea>
       <div class="row">
         <div><label>ROUNDS</label><input type="number" id="rounds" min="1" max="12" value="4"></div>
@@ -895,6 +917,26 @@ async function reroll(idx){
   unthink();
 }
 
+/* ============================================================== dice */
+let TOPICS = [];
+function rollTopic(){
+  const pool = $('dicePool').value;
+  const list = TOPICS.filter(t => pool==='any' || t.cat===pool);
+  if (!list.length){ log('no topics loaded (topics.json missing?)'); return; }
+  const btn = $('btnRoll'); btn.disabled = true;
+  let spins = 7;
+  const spin = () => {
+    const t = list[Math.floor(Math.random()*list.length)];
+    $('topic').value = t.t;
+    if (--spins > 0) setTimeout(spin, 60 + (7-spins)*35);
+    else {
+      btn.disabled = false;
+      log(`ROLL [${t.cat}] ${t.t}`);
+    }
+  };
+  spin();
+}
+
 /* ============================================================== endpoint */
 async function pingEndpoint(){
   $('pingOut').textContent='pinging…';
@@ -1092,6 +1134,10 @@ document.addEventListener('keydown', e=>{ if (e.key==='Escape' && tourIdx>=0) to
     $('endpoint').value=d.endpoint; $('apikey').value=d.api_key; defModel=d.model;
   }catch(e){ $('endpoint').value='http://localhost:8080/v1/chat/completions'; }
   $('model').innerHTML = `<option value="${esc(defModel)}">${esc(defModel)}</option>`;
+  try{
+    TOPICS = await (await fetch('/api/topics')).json();
+    log(`topic bank loaded: ${TOPICS.length} theses (${TOPICS.filter(t=>t.cat==='serious').length} serious / ${TOPICS.filter(t=>t.cat==='absurd').length} absurd)`);
+  }catch(e){ log('topic bank unavailable: '+e.message); }
   loadCast();
   loadModels();
   log('GHOST PROTOCOL studio online.');
