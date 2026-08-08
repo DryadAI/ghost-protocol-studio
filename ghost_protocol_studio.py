@@ -12,6 +12,9 @@
 # =============================================================================
 import json
 import os
+import re
+import subprocess
+import time
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -20,7 +23,18 @@ PORT = int(os.environ.get("GP_PORT", "7860"))
 BIND = os.environ.get("GP_BIND", "127.0.0.1")  # GP_BIND=0.0.0.0 to reach it from other machines
 DEFAULT_ENDPOINT = os.environ.get("GP_ENDPOINT", "http://localhost:8080/v1/chat/completions")
 DEFAULT_KEY = os.environ.get("GP_API_KEY", "")
-DEFAULT_MODEL = os.environ.get("GP_MODEL", "google/gemini-2.0-flash")
+DEFAULT_MODEL = os.environ.get("GP_MODEL", "ollama/qwen3:14b")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VOICES_DIR = os.path.join(BASE_DIR, "voices")
+BUILD_DIR = os.path.join(BASE_DIR, "build")
+RENDERS_DIR = os.path.join(BASE_DIR, "renders")
+PORTRAITS_DIR = os.path.join(BASE_DIR, "assets", "portraits")
+BACKDROPS_DIR = os.path.join(BASE_DIR, "assets", "backdrops")
+VIDEO_W, VIDEO_H, VIDEO_BG = 1920, 1080, "0x0a0e14"
+PORTRAIT_SIZE = 640
+FPS = 25
+TEXT_BOX = "box=1:boxcolor=0x0a0e14@0.55:boxborderw=10"
 
 
 def proxy_chat(body: dict) -> dict:
@@ -69,6 +83,184 @@ def proxy_ping(body: dict) -> dict:
         return {"ok": False, "detail": f"{url} -> {type(e).__name__}: {e}"}
 
 
+def proxy_models(body: dict) -> dict:
+    """Fetch the model list from <base>/models on the configured endpoint."""
+    endpoint = body.get("endpoint") or DEFAULT_ENDPOINT
+    base = endpoint.split("/chat/completions")[0].rstrip("/")
+    url = base + "/models"
+    headers = {}
+    api_key = body.get("api_key") or DEFAULT_KEY
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        ids = sorted(m["id"] for m in data.get("data", []) if "id" in m)
+        return {"ok": True, "models": ids}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def sanitize_speaker_name(name: str) -> str:
+    return re.sub(r"[:'\\,%]", "", name or "SPEAKER").upper()
+
+
+def wrap_text(s: str, width: int) -> str:
+    out = []
+    for line in (s or "").split("\n"):
+        cur = ""
+        for word in line.split(" "):
+            if len((cur + " " + word).strip()) > width:
+                out.append(cur.strip())
+                cur = word
+            else:
+                cur += " " + word
+        out.append(cur.strip())
+    return "\n".join(o for o in out if o)
+
+
+def build_bg_input(dur: str, fmt: str):
+    """Background video input for a segment: format-specific backdrop image if one exists, else the flat color."""
+    backdrop_path = os.path.join(BACKDROPS_DIR, f"{fmt}.jpg")
+    if fmt and os.path.isfile(backdrop_path):
+        args = ["-loop", "1", "-t", dur, "-i", backdrop_path]
+        prep = f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={VIDEO_W}:{VIDEO_H}"
+        return args, prep
+    args = ["-f", "lavfi", "-i", f"color=c={VIDEO_BG}:s={VIDEO_W}x{VIDEO_H}:d={dur}"]
+    return args, None
+
+
+def render_episode(payload: dict) -> dict:
+    """Render a transcript to episode.mp4 server-side using piper + ffmpeg."""
+    segments = payload.get("segments") or []
+    fmt = payload.get("format") or ""
+    if not segments:
+        return {"ok": False, "error": "no segments to render"}
+    for tool in ("piper", "ffmpeg", "ffprobe"):
+        try:
+            subprocess.run([tool, "-h" if tool == "piper" else "-version"],
+                            capture_output=True, timeout=10)
+        except FileNotFoundError:
+            return {"ok": False, "error": f"'{tool}' not found on PATH"}
+
+    os.makedirs(BUILD_DIR, exist_ok=True)
+    os.makedirs(RENDERS_DIR, exist_ok=True)
+    for f in os.listdir(BUILD_DIR):
+        try:
+            os.remove(os.path.join(BUILD_DIR, f))
+        except OSError:
+            pass
+
+    concat_lines = []
+    for idx, seg in enumerate(segments):
+        i = f"{idx:03d}"
+        name = sanitize_speaker_name(seg.get("name"))
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        voice = seg.get("voice") or "en_US-lessac-medium"
+        color = seg.get("hex") or "0xf8f8f2"
+        voice_path = os.path.join(VOICES_DIR, f"{voice}.onnx")
+        if not os.path.isfile(voice_path):
+            return {"ok": False, "error": f"voice model not found: {voice}.onnx (segment {idx}, {name})"}
+
+        portrait_path = os.path.join(PORTRAITS_DIR, f"{seg.get('sid', '')}.jpg")
+        has_portrait = bool(seg.get("sid")) and os.path.isfile(portrait_path)
+
+        txt_path = os.path.join(BUILD_DIR, f"{i}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(wrap_text(text, 48 if has_portrait else 74))
+
+        wav_path = os.path.join(BUILD_DIR, f"{i}.wav")
+        try:
+            subprocess.run(
+                ["piper", "--model", voice_path, "--output_file", wav_path],
+                input=text.encode("utf-8"), capture_output=True, check=True, timeout=120,
+            )
+        except subprocess.CalledProcessError as e:
+            return {"ok": False, "error": f"piper failed on segment {idx} ({name}): {e.stderr.decode('utf-8','replace')[:500]}"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"piper timed out on segment {idx} ({name})"}
+
+        try:
+            dur = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", wav_path],
+                capture_output=True, text=True, check=True, timeout=30,
+            ).stdout.strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            return {"ok": False, "error": f"ffprobe failed on segment {idx} ({name}): {e}"}
+
+        seg_path = os.path.join(BUILD_DIR, f"{i}.mp4")
+        bg_args, bg_prep = build_bg_input(dur, fmt)
+        if has_portrait:
+            # Ken Burns-style slow zoom + wobbling pan over the cutout portrait ("jittery nudge" feel),
+            # composited onto the format's backdrop (or flat color if none) with name/caption in the right column.
+            nframes = max(1, round(float(dur) * FPS))
+            text_x = 120 + PORTRAIT_SIZE + 40
+            bg_ref = "[bgprep]" if bg_prep else "[1:v]"
+            prep_chain = f"[1:v]{bg_prep}[bgprep];" if bg_prep else ""
+            fc = (
+                f"[0:v]scale=1536:1536,zoompan=z='min(zoom+0.0008,1.15)':"
+                f"x='iw/2-(iw/zoom/2)+40*sin(on/12)':y='ih/2-(ih/zoom/2)+25*sin(on/9+1)':"
+                f"d={nframes}:s={PORTRAIT_SIZE}x{PORTRAIT_SIZE}:fps={FPS}[portrait];"
+                f"{prep_chain}"
+                f"{bg_ref}[portrait]overlay=120:100[bg1];"
+                f"[bg1]drawtext=text='[ {name} ]':x=120:y={PORTRAIT_SIZE + 140}:fontsize=42:fontcolor={color}:font=Monospace:{TEXT_BOX},"
+                f"drawtext=textfile='{txt_path}':x={text_x}:y=160:fontsize=32:fontcolor=0xf8f8f2:font=Monospace:line_spacing=14:{TEXT_BOX}[vout]"
+            )
+            cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-loop", "1", "-t", dur, "-i", portrait_path,
+                *bg_args,
+                "-i", wav_path,
+                "-filter_complex", fc, "-map", "[vout]", "-map", "2:a",
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", seg_path,
+            ]
+        else:
+            prep_prefix = f"{bg_prep}," if bg_prep else ""
+            vf = (
+                f"{prep_prefix}"
+                f"drawtext=text='[ {name} ]':x=120:y=140:fontsize=46:fontcolor={color}:font=Monospace:{TEXT_BOX},"
+                f"drawtext=textfile='{txt_path}':x=120:y=260:fontsize=34:fontcolor=0xf8f8f2:font=Monospace:line_spacing=16:{TEXT_BOX}"
+            )
+            cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                *bg_args,
+                "-i", wav_path, "-vf", vf,
+                "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", seg_path,
+            ]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+        except subprocess.CalledProcessError as e:
+            return {"ok": False, "error": f"ffmpeg failed on segment {idx} ({name}): {e.stderr.decode('utf-8','replace')[:500]}"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"ffmpeg timed out on segment {idx} ({name})"}
+        concat_lines.append(f"file '{i}.mp4'\n")
+
+    if not concat_lines:
+        return {"ok": False, "error": "no non-empty segments to render"}
+
+    concat_path = os.path.join(BUILD_DIR, "concat.txt")
+    with open(concat_path, "w", encoding="utf-8") as f:
+        f.writelines(concat_lines)
+
+    out_name = f"episode_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+    out_path = os.path.join(RENDERS_DIR, out_name)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat_path, "-c", "copy", out_path],
+            capture_output=True, check=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        return {"ok": False, "error": f"final concat failed: {e.stderr.decode('utf-8','replace')[:500]}"}
+
+    size_mb = round(os.path.getsize(out_path) / 1e6, 1)
+    return {"ok": True, "file": out_name, "url": f"/renders/{out_name}", "size_mb": size_mb}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter logs
         if "/api/" in (args[0] if args else ""):
@@ -89,6 +281,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps({
                 "endpoint": DEFAULT_ENDPOINT, "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL,
             }).encode())
+        elif self.path.startswith("/renders/"):
+            fname = os.path.basename(self.path[len("/renders/"):])
+            fpath = os.path.join(RENDERS_DIR, fname)
+            if fname and os.path.isfile(fpath):
+                with open(fpath, "rb") as f:
+                    self._send(200, "video/mp4", f.read())
+            else:
+                self._send(404, "text/plain", b"not found")
         else:
             self._send(404, "text/plain", b"not found")
 
@@ -103,6 +303,10 @@ class Handler(BaseHTTPRequestHandler):
             out = proxy_chat(body)
         elif self.path == "/api/ping":
             out = proxy_ping(body)
+        elif self.path == "/api/models":
+            out = proxy_models(body)
+        elif self.path == "/api/render":
+            out = render_episode(body)
         else:
             out = {"ok": False, "error": "unknown route"}
         self._send(200, "application/json", json.dumps(out).encode("utf-8"))
@@ -201,6 +405,21 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
 #cfg.hide,#right.hide{display:none}
 @media (max-width:1100px){#right:not(.pin){display:none}}
 #right.pin{display:block}
+/* ---------- walkthrough tour ---------- */
+#tourBackdrop{position:fixed;inset:0;background:rgba(5,8,14,.62);z-index:9990;pointer-events:none;display:none}
+.tour-spot{position:relative!important;z-index:9991;outline:2px solid var(--cyan);outline-offset:3px;border-radius:4px;box-shadow:0 0 10px var(--cyan)}
+#tourCard{position:fixed;z-index:9992;width:320px;background:var(--panel2);border:1px solid var(--cyan);border-radius:6px;padding:14px 16px;box-shadow:0 8px 30px rgba(0,0,0,.6);display:none}
+#tourClose{position:absolute;top:8px;right:10px;background:none;border:none;color:var(--dim);font-size:14px;cursor:pointer;padding:0;line-height:1}
+#tourClose:hover{color:var(--red)}
+#tourStepNum{font-size:10px;color:var(--dim);letter-spacing:1px;margin-bottom:6px}
+#tourCard h3{font-size:12px;letter-spacing:2px;color:var(--cyan);margin-bottom:8px;padding-right:16px}
+#tourCard p{font-size:12px;line-height:1.55;color:var(--fg);margin-bottom:12px}
+#tourCard p b{color:var(--yellow)}
+#tourCard p code{color:var(--green);font-size:11px}
+.tourFoot{display:flex;justify-content:space-between;gap:8px}
+.tourFoot button{background:var(--panel);border:1px solid var(--line);color:var(--fg);padding:5px 10px;font-family:inherit;font-size:11px;letter-spacing:1px;cursor:pointer;border-radius:3px}
+.tourFoot button:hover{border-color:var(--cyan);color:var(--cyan)}
+.tourFoot button:disabled{opacity:.35;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -210,6 +429,7 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
   <div class="spacer"></div>
   <button class="tog on" id="togCfg" onclick="$('cfg').classList.toggle('hide');this.classList.toggle('on')">CONFIG</button>
   <button class="tog on" id="togExp" onclick="$('right').classList.toggle('hide');$('right').classList.toggle('pin');this.classList.toggle('on')">EXPORT</button>
+  <button class="tog" id="togTour" onclick="tourStart()">WALKTHROUGH</button>
   <span id="statusText">IDLE</span>
 </header>
 <main>
@@ -245,9 +465,10 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
       <label>API KEY (blank if Bifrost holds keys)</label>
       <input type="password" id="apikey" value="">
       <label>DEFAULT MODEL</label>
-      <input type="text" id="model" value="">
+      <select id="model"></select>
+      <button class="b" id="btnRefreshModels" style="width:100%;margin-top:6px;font-size:10px" onclick="loadModels()">↻ REFRESH MODEL LIST</button>
       <label class="chk"><input type="checkbox" id="simMode"> SIMULATION MODE (no API — canned lines)</label>
-      <button class="b" style="width:100%;margin-top:9px" onclick="pingEndpoint()">TEST CONNECTION</button>
+      <button class="b" id="btnPing" style="width:100%;margin-top:9px" onclick="pingEndpoint()">TEST CONNECTION</button>
       <div id="pingOut" style="font-size:11px;color:var(--dim);margin-top:6px;word-break:break-all"></div>
     </div>
   </div>
@@ -277,9 +498,11 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
       <h2>04 // EXPORT</h2>
       <button class="b" onclick="dlTranscript('json')">TRANSCRIPT .JSON</button>
       <button class="b" onclick="dlTranscript('txt')">TRANSCRIPT .TXT</button>
-      <button class="b go" onclick="dlCompileScript()">COMPILE_SHOW.SH</button>
+      <button class="b go" id="btnRender" onclick="renderEpisode()">▶ RENDER EPISODE.MP4</button>
+      <div id="renderResult" style="margin-top:8px"></div>
+      <button class="b" onclick="dlCompileScript()" style="width:100%;margin-top:10px;font-size:10px">DOWNLOAD compile_show.sh</button>
       <div style="font-size:10px;color:var(--dim);line-height:1.5;margin-top:4px">
-        compile_show.sh = piper-tts voices + ffmpeg terminal-style video. Run it next to nothing else; it builds <b>episode.mp4</b>.
+        RENDER runs piper + ffmpeg on this server and builds <b>episode.mp4</b> directly — no shell needed. The .sh download is only for rendering on another machine.
       </div>
     </div>
     <div class="sec">
@@ -288,6 +511,17 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
     </div>
   </div>
 </main>
+<div id="tourBackdrop"></div>
+<div id="tourCard">
+  <button id="tourClose" onclick="tourClose()" title="close walkthrough">✕</button>
+  <div id="tourStepNum"></div>
+  <h3 id="tourTitle"></h3>
+  <p id="tourBody"></p>
+  <div class="tourFoot">
+    <button id="tourBack" onclick="tourBack()">◀ BACK</button>
+    <button id="tourNext" onclick="tourNext()">NEXT ▶</button>
+  </div>
+</div>
 <script>
 "use strict";
 /* ============================================================== state */
@@ -372,6 +606,30 @@ Lens: outcomes, aggregate wellbeing, cost-benefit, measurable consequences. Argu
 ],
 };
 let cast = [];           // live, editable copy for current format
+let MODEL_LIST = [];     // populated from /api/models
+
+function modelOptionsHtml(list, selected, includeBlank){
+  let html = includeBlank ? `<option value="">(default)</option>` : '';
+  html += list.map(m=>`<option value="${esc(m)}" ${m===selected?'selected':''}>${esc(m)}</option>`).join('');
+  if (selected && !list.includes(selected)) html += `<option value="${esc(selected)}" selected>${esc(selected)}</option>`;
+  return html;
+}
+function refreshModelSelects(){
+  $('model').innerHTML = modelOptionsHtml(MODEL_LIST, $('model').value, false);
+  document.querySelectorAll('.castModelSel').forEach(sel=>{
+    const idx = +sel.dataset.idx;
+    sel.innerHTML = modelOptionsHtml(MODEL_LIST, cast[idx].model, true);
+  });
+}
+async function loadModels(){
+  try{
+    const r = await fetch('/api/models',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({endpoint:$('endpoint').value.trim(), api_key:$('apikey').value})});
+    const j = await r.json();
+    if (j.ok){ MODEL_LIST = j.models; refreshModelSelects(); log('model list loaded ('+MODEL_LIST.length+')'); }
+    else log('model list fetch failed: '+j.error);
+  }catch(e){ log('model list fetch error: '+e.message); }
+}
 
 function loadCast(){
   cast = CASTS[S.format].map(c => ({...c, model:''}));
@@ -384,7 +642,7 @@ function loadCast(){
       </div>
       <div class="body">
         <label>NAME</label><input type="text" value="${esc(c.name)}" onchange="cast[${i}].name=this.value">
-        <label>MODEL OVERRIDE (blank = default)</label><input type="text" placeholder="e.g. groq/llama-3.3-70b-versatile" onchange="cast[${i}].model=this.value">
+        <label>MODEL OVERRIDE (blank = default)</label><select class="castModelSel" data-idx="${i}" onchange="cast[${i}].model=this.value">${modelOptionsHtml(MODEL_LIST, c.model, true)}</select>
         <label>VOICE (piper)</label>
         <select onchange="cast[${i}].voice=this.value">${VOICES.map(v=>`<option ${v===c.voice?'selected':''}>${v}</option>`).join('')}</select>
         <label>SYSTEM PROMPT</label>
@@ -646,6 +904,7 @@ async function pingEndpoint(){
     const j=await r.json();
     $('pingOut').textContent=(j.ok?'✔ ':'✘ ')+j.detail;
     $('pingOut').style.color=j.ok?'var(--green)':'var(--red)';
+    if (j.ok) loadModels();
   }catch(e){ $('pingOut').textContent='✘ '+e.message; $('pingOut').style.color='var(--red)'; }
 }
 
@@ -727,14 +986,114 @@ echo "=========================================="
   dl('compile_show.sh', sh, 'text/x-shellscript');
   log('compile_show.sh exported ('+S.transcript.length+' segments)');
 }
+async function renderEpisode(){
+  if (!S.transcript.length) return alert('No transcript yet — run an episode first.');
+  const btn = $('btnRender'), origText = btn.textContent;
+  btn.disabled = true; btn.textContent = 'RENDERING…';
+  $('renderResult').innerHTML = '';
+  log('render: starting ('+S.transcript.length+' segments)…');
+  try{
+    const segments = S.transcript.map(t=>({sid:t.sid, name:t.name, text:t.text, voice:t.voice||'en_US-lessac-medium', hex:t.hex||'0xf8f8f2'}));
+    const r = await fetch('/api/render',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({segments, format:S.format})});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error);
+    log('render: done -> '+j.file+' ('+j.size_mb+' MB)');
+    $('renderResult').innerHTML =
+      `<video controls style="width:100%;border-radius:4px;margin-bottom:6px" src="${j.url}"></video>
+       <a class="b go" style="display:block;text-align:center;text-decoration:none" href="${j.url}" download="${esc(j.file)}">⬇ DOWNLOAD ${esc(j.file)}</a>`;
+  }catch(e){
+    log('render ERROR: '+e.message);
+    alert('Render failed: '+e.message);
+  }
+  btn.disabled = false; btn.textContent = origText;
+}
+
+/* ============================================================== walkthrough tour */
+function ensureCfgVisible(){ $('cfg').classList.remove('hide'); $('togCfg').classList.add('on'); }
+function ensureExportVisible(){ $('right').classList.remove('hide'); $('right').classList.add('pin'); $('togExp').classList.add('on'); }
+const TOUR = [
+ {sel:'#fmt', title:'01 // FORMAT', onEnter:ensureCfgVisible,
+  body:'Pick a debate format here. For your first episode, try <b>Socratic Stress-Test</b> — shortest, fewest moving parts, runs start-to-finish with no human input needed.'},
+ {sel:'#topic', title:'TOPIC / THESIS', onEnter:ensureCfgVisible,
+  body:'Write a clear, arguable one-line claim. Socratic works best on a binary position — a real "yes" side and "no" side.'},
+ {sel:'#rounds', title:'ROUNDS & TEMP', onEnter:ensureCfgVisible,
+  body:'Rounds set episode length — 4 rounds is a solid 8–10 min episode. Temp controls response randomness; 0.5 is a good default.'},
+ {sel:'#castList', title:'02 // CAST', onEnter:ensureCfgVisible,
+  body:'Each speaker\'s name, system prompt, model override, and Piper voice — all editable. Defaults are ready to go, no changes needed yet.'},
+ {sel:'#endpoint', title:'03 // ENGINE', onEnter:ensureCfgVisible,
+  body:'Should already point at your Bifrost gateway. Leave API KEY blank if Bifrost holds the keys.'},
+ {sel:'#btnPing', title:'TEST CONNECTION', onEnter:ensureCfgVisible,
+  body:'Click this now. You should see a green ✔ reachable message below it. If it fails, the Bifrost container may be down.'},
+ {sel:'#btnRun', title:'▶ INITIALIZE',
+  body:'When you\'re ready, click this to start the run. Socratic plays out automatically — just watch the feed.'},
+ {sel:'#feed', title:'THE FEED',
+  body:'Lines stream in live. After the run, click any line to edit it, ↻ RE-ROLL to regenerate, or ✕ CUT to remove it.'},
+ {sel:'#right', title:'04 // EXPORT', onEnter:ensureExportVisible,
+  body:'Grab the transcript, or click <b>▶ RENDER EPISODE.MP4</b> — the server runs piper + ffmpeg for you and hands back a playable <b>episode.mp4</b>. No shell needed.'},
+];
+let tourIdx = -1, tourLastEl = null;
+function tourClearHighlight(){ if (tourLastEl){ tourLastEl.classList.remove('tour-spot'); tourLastEl=null; } }
+function tourStart(){
+  tourIdx = 0;
+  $('tourBackdrop').style.display='block';
+  renderTourStep();
+}
+function tourClose(){
+  tourIdx = -1;
+  tourClearHighlight();
+  $('tourBackdrop').style.display='none';
+  $('tourCard').style.display='none';
+}
+function tourNext(){ if (tourIdx < TOUR.length-1){ tourIdx++; renderTourStep(); } else tourClose(); }
+function tourBack(){ if (tourIdx > 0){ tourIdx--; renderTourStep(); } }
+function tourPositionCard(rect){
+  const card=$('tourCard'), cw=card.offsetWidth, ch=card.offsetHeight;
+  const vw=window.innerWidth, vh=window.innerHeight, pad=16;
+  let top, left;
+  if (!rect){ top=(vh-ch)/2; left=(vw-cw)/2; }
+  else if (rect.right+pad+cw < vw){ left=rect.right+pad; top=Math.min(Math.max(rect.top,pad), vh-ch-pad); }
+  else if (rect.bottom+pad+ch < vh){ top=rect.bottom+pad; left=Math.min(Math.max(rect.left,pad), vw-cw-pad); }
+  else if (rect.left-pad-cw > 0){ left=rect.left-pad-cw; top=Math.min(Math.max(rect.top,pad), vh-ch-pad); }
+  else { top=Math.max(pad, rect.top-pad-ch); left=Math.min(Math.max(rect.left,pad), vw-cw-pad); }
+  card.style.top=top+'px'; card.style.left=left+'px';
+}
+function renderTourStep(){
+  tourClearHighlight();
+  const step = TOUR[tourIdx];
+  if (step.onEnter) step.onEnter();
+  const card = $('tourCard');
+  card.style.display='block';
+  $('tourStepNum').textContent = (tourIdx+1)+' / '+TOUR.length;
+  $('tourTitle').innerHTML = step.title;
+  $('tourBody').innerHTML = step.body;
+  $('tourBack').disabled = tourIdx===0;
+  $('tourNext').textContent = tourIdx===TOUR.length-1 ? 'FINISH' : 'NEXT ▶';
+  requestAnimationFrame(()=>{
+    const el = step.sel ? document.querySelector(step.sel) : null;
+    if (el){
+      el.scrollIntoView({block:'center', behavior:'smooth'});
+      el.classList.add('tour-spot');
+      tourLastEl = el;
+      setTimeout(()=>tourPositionCard(el.getBoundingClientRect()), 260);
+    } else {
+      tourPositionCard(null);
+    }
+  });
+}
+window.addEventListener('resize', ()=>{ if (tourIdx>=0) tourPositionCard(tourLastEl?tourLastEl.getBoundingClientRect():null); });
+document.addEventListener('keydown', e=>{ if (e.key==='Escape' && tourIdx>=0) tourClose(); });
 
 /* ============================================================== boot */
 (async function(){
+  let defModel = 'ollama/qwen3:14b';
   try{
     const d = await (await fetch('/api/defaults')).json();
-    $('endpoint').value=d.endpoint; $('apikey').value=d.api_key; $('model').value=d.model;
+    $('endpoint').value=d.endpoint; $('apikey').value=d.api_key; defModel=d.model;
   }catch(e){ $('endpoint').value='http://localhost:8080/v1/chat/completions'; }
+  $('model').innerHTML = `<option value="${esc(defModel)}">${esc(defModel)}</option>`;
   loadCast();
+  loadModels();
   log('GHOST PROTOCOL studio online.');
   log('Tip: enable SIMULATION MODE to test the flow with zero API calls.');
 })();

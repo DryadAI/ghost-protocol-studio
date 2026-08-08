@@ -34,7 +34,8 @@ Every cast member's name, system prompt, model override, and Piper voice is edit
 ## Export → video (04 // EXPORT)
 
 - `transcript.json` / `transcript.txt`
-- `compile_show.sh` — self-contained bash script embedding the episode. It uses **piper-tts** (per-speaker voices) and **ffmpeg** (terminal-styled 1080p segments, concatenated) to produce `episode.mp4`.
+- `▶ RENDER EPISODE.MP4` (in the UI) — server-side **piper-tts** (per-speaker voices) + **ffmpeg** render. Each cast member with a portrait in `assets/portraits/<sid>.jpg` gets a Terry Gilliam-style cutout card (slow Ken Burns zoom + wobbling pan) instead of the plain color background; lines without a portrait (human co-hosts) fall back to the original full-width text layout. If `assets/backdrops/<format>.jpg` exists (one per show format — socratic/roundtable/tribunal/triad), it fills the whole frame behind everything else; falls back to the flat color background otherwise.
+- `compile_show.sh` — manual/offline fallback with the same piper+ffmpeg approach but the original plain terminal-styled segments (no portraits/animation). Useful for rendering on another machine.
 
 One-time setup on Arch:
 
@@ -56,4 +57,4 @@ bash compile_show.sh         # -> episode.mp4
 2. TEST CONNECTION (or tick Simulation Mode).
 3. ▶ INITIALIZE — watch the feed; type when the yellow human box appears.
 4. Edit/re-roll any weak lines after the run.
-5. Export `compile_show.sh`, run it, upload `episode.mp4`.
+5. Click **▶ RENDER EPISODE.MP4** — server-side piper+ffmpeg render, playable in the panel, ready to upload. (`compile_show.sh` download still available for rendering elsewhere.)
