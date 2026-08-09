@@ -742,6 +742,8 @@ class Episode:
         self.events = []                      # mirrors bus.jsonl
         self.human_gate = threading.Event()   # set by /api/episode/input
         self.human_text = None
+        self.approval_gate = threading.Event()  # set by /api/episode/approve
+        self.approval_ok = True
         self.abort = threading.Event()
         self.runtime = {}                     # endpoint/api_key/etc — memory only, never on disk
 
@@ -968,14 +970,30 @@ def run_episode(ep: "Episode"):
     """The run loop. Lives on the server, so the browser is optional from here on."""
     meta, rt = ep.meta, ep.runtime
     cast = {(c.get("slot") or c.get("sid")): c for c in meta["cast"]}
+    beats = []
+    if meta.get("writers_room") and writers_room_pass(ep):
+        beats = meta.get("beats") or []
+    if ep.abort.is_set():
+        ep.set_state("post", "aborted")
+        return
     plan = build_plan(meta["format"], meta["topic"], meta["rounds"], meta["cast"], meta.get("humans", []))
     ep.emit("stage_manager", "artifact", {"kind": "plan", "turns": len(plan)})
-    ep.set_state("running", f"{len(plan)} turns planned")
-    sim_n = 0
+    ep.set_state("running", f"{len(plan)} turns planned" + (f", {len(beats)} beats" if beats else ""))
+    sim_n, beat_at = 0, -1
     try:
-        for step in plan:
+        for idx, step in enumerate(plan):
             if ep.abort.is_set():
                 break
+            # The current beat rides along in the turn instruction — this is how the
+            # beat sheet becomes performance rather than a document nobody reads.
+            beat = None
+            if beats:
+                bi = min(len(beats) - 1, idx * len(beats) // max(1, len(plan)))
+                beat = beats[bi]
+                if bi != beat_at:
+                    beat_at = bi
+                    ep.emit("stage_manager", "note", {"op": "beat", "n": beat["n"], "of": len(beats),
+                                                      "beat": beat["beat"]})
             if step.get("human"):
                 h = step["human"]
                 ep.set_state("awaiting_human", h["name"])
@@ -996,6 +1014,17 @@ def run_episode(ep: "Episode"):
             if not spk:
                 ep.emit("stage_manager", "note", {"op": "skip", "sid": step["sid"], "why": "no one cast in this chair"})
                 continue
+            inst = step["inst"]
+            if beat:
+                inst += f"\n\nBEAT {beat['n']} OF {len(beats)} — {beat['beat']}"
+                if beat.get("collision"):
+                    inst += f"\nPLANNED COLLISION: {beat['collision']}"
+                if beat.get("callback"):
+                    inst += f"\nCALLBACK SLOT: {beat['callback']}"
+                inst += "\nPlay the beat, but never announce it."
+            if idx == 0 and meta.get("cold_open") and beats:
+                inst += f"\n\nCOLD OPEN: {meta['cold_open']}"
+            step = dict(step, inst=inst)
             if rt.get("sim"):
                 sim_n += 1
                 text = sim_line(spk, sim_n)
@@ -1030,6 +1059,102 @@ def crew_member(sid: str) -> dict:
 
 
 SIM_CUT_WHYS = ["SLOW.", "REPEAT.", "EARNED-NOTHING.", "FLAB.", "DARLING."]
+
+# --- 3.2 INKWELL, head writer -------------------------------------------------
+SIM_BEATSHEET = """COLD OPEN: The dice land on the thesis and nobody in the room admits it is funny.
+BEAT 1 | Establish the vault: state the thesis in its strongest form | CALLBACK: the definition, later
+BEAT 2 | First pressure: force a definition nobody wants to give | COLLISION: interrogator vs defender
+BEAT 3 | The turn: a concession that looks small and is not | CALLBACK: beat 1's definition
+BEAT 4 | Escalate: make the concession expensive | COLLISION: everyone vs the concession
+BEAT 5 | Close the vault: the kernel names what actually happened
+"""
+
+
+def parse_beatsheet(text: str) -> tuple:
+    """INKWELL writes prose with structure in it. Pull out the cold open and the beats;
+    whatever else it wrote survives verbatim in beatsheet.md."""
+    cold, beats = "", []
+    for line in text.splitlines():
+        s = line.strip().lstrip("-*#> ").strip()
+        m = re.match(r"^COLD[ _-]?OPEN\s*[:|]\s*(.+)$", s, re.I)
+        if m:
+            cold = m.group(1).strip()
+            continue
+        m = re.match(r"^BEAT\s*(\d+)\s*[:|]\s*(.+)$", s, re.I)
+        if not m:
+            continue
+        parts = [p.strip() for p in m.group(2).split("|") if p.strip()]
+        if not parts:
+            continue
+        beat = {"n": int(m.group(1)), "beat": parts[0]}
+        for p in parts[1:]:
+            mm = re.match(r"^(COLLISION|CALLBACK)\s*:\s*(.+)$", p, re.I)
+            if mm:
+                beat[mm.group(1).lower()] = mm.group(2).strip()
+        beats.append(beat)
+    return cold, beats
+
+
+def episode_brief(ep: "Episode") -> str:
+    """The brief the writers work from — the episode dir's own if it has one,
+    otherwise assembled from what the director set up in the UI."""
+    brief = _read(os.path.join(ep.path, "brief.md"))
+    if brief.strip():
+        return brief
+    m = ep.meta
+    roster = ", ".join("{} ({})".format(c.get("name"), c.get("slot")) for c in m.get("cast", []))
+    humans = ", ".join(h.get("name", "") for h in m.get("humans", [])) or "none"
+    return (f"# {ep.id}\n\nTopic/thesis: {m.get('topic')}\nFormat: {m.get('format')}\n"
+            f"Rounds: {m.get('rounds')}\nCast: {roster}\nHumans: {humans}\n")
+
+
+def writers_room_pass(ep: "Episode") -> bool:
+    """INKWELL turns the brief + the series bible into a beat sheet, then waits for a yes.
+    Returns True if the beats were approved; False means run the episode straight."""
+    inkwell = crew_member("inkwell")
+    bible = _read(os.path.join(SHOW_DIR, "SERIES_BIBLE.md")) if SHOW_DIR else ""
+    ep.emit("inkwell", "note", {"op": "writers_room_start",
+                                "writer": (inkwell or {}).get("name", "INKWELL (built-in)"),
+                                "bible": bool(bible.strip())})
+    if ep.meta.get("sim") or not inkwell:
+        raw = SIM_BEATSHEET
+    else:
+        rt = ep.runtime
+        res = proxy_chat({
+            "endpoint": rt.get("endpoint") or DEFAULT_ENDPOINT, "api_key": rt.get("api_key") or DEFAULT_KEY,
+            "model": rt.get("model") or DEFAULT_MODEL, "temperature": 0.6,
+            "messages": [{"role": "system", "content": inkwell["sys"]},
+                         {"role": "user", "content":
+                          (f"SERIES BIBLE:\n{bible}\n\n" if bible.strip() else "")
+                          + f"EPISODE BRIEF:\n{episode_brief(ep)}\n\n"
+                          f"Write the beat sheet for this episode: {min(6, max(3, ep.meta.get('rounds', 4)))} beats. "
+                          "Format every line exactly as one of:\n"
+                          "COLD OPEN: <one line>\n"
+                          "BEAT <n> | <what happens> | COLLISION: <who ambushes whom> | CALLBACK: <slot>\n\n"
+                          "COLLISION and CALLBACK are optional per beat. No other prose."}]})
+        if not res.get("ok"):
+            ep.emit("inkwell", "note", {"op": "error", "why": res.get("error", "")})
+            return False
+        raw = res["text"]
+    cold, beats = parse_beatsheet(raw)
+    if not beats:
+        ep.emit("inkwell", "note", {"op": "writers_room_done", "beats": 0, "why": "no beats parsed"})
+        return False
+    with open(os.path.join(ep.path, "beatsheet.md"), "w", encoding="utf-8") as f:
+        f.write(f"# Beat sheet — {ep.id}\n\n_{(inkwell or {}).get('name', 'INKWELL')}, "
+                f"from the brief and the series bible._\n\n{raw.strip()}\n")
+    ep.meta["cold_open"], ep.meta["beats"] = cold, beats
+    ep.save_meta()
+    ep.emit("inkwell", "artifact", {"kind": "beatsheet", "cold_open": cold, "beats": beats,
+                                    "file": "beatsheet.md"})
+    ep.emit("inkwell", "approval_request", {"kind": "beatsheet_approval", "beats": len(beats)})
+    ep.set_state("brief", "awaiting beat sheet approval")
+    ep.approval_gate.clear()
+    while not ep.approval_gate.wait(0.5):
+        if ep.abort.is_set():
+            return False
+    ep.emit("director", "note", {"op": "beatsheet_" + ("approved" if ep.approval_ok else "skipped")})
+    return bool(ep.approval_ok)
 
 
 def parse_cuts(text: str, valid: set) -> list:
@@ -1116,6 +1241,7 @@ def start_episode(body: dict) -> dict:
         os.makedirs(path, exist_ok=True)
     meta = {"id": eid, "format": fmt, "topic": topic, "rounds": int(body.get("rounds") or 4),
             "cast": cast, "humans": body.get("humans") or [], "sim": bool(body.get("sim")),
+            "writers_room": bool(body.get("writers_room")),
             "show": SHOW_DIR, "created": time.time(), "updated": time.time(), "state": "brief"}
     ep = Episode(eid, path, meta)
     # Credentials stay in memory: an episode directory is committed to a repo.
@@ -1247,10 +1373,15 @@ class Handler(BaseHTTPRequestHandler):
                                   "model": body.get("model"), "sim": ep.meta.get("sim")}
                 threading.Thread(target=editor_pass, args=(ep,), daemon=True, name=f"splice-{ep.id}").start()
                 out = {"ok": True}
-        elif self.path in ("/api/episode/input", "/api/episode/abort", "/api/episode/event"):
+        elif self.path in ("/api/episode/input", "/api/episode/abort", "/api/episode/event",
+                           "/api/episode/approve"):
             ep = get_episode(body.get("id", ""))
             if not ep:
                 out = {"ok": False, "error": "no such episode"}
+            elif self.path == "/api/episode/approve":
+                ep.approval_ok = bool(body.get("ok", True))
+                ep.approval_gate.set()
+                out = {"ok": True}
             elif self.path == "/api/episode/input":
                 ep.human_text = (body.get("text") or "").strip() or None   # blank = SKIP
                 ep.human_gate.set()
@@ -1300,6 +1431,17 @@ header h1 b{color:var(--green)}
 .led.wait{background:var(--yellow);box-shadow:0 0 8px var(--yellow)}
 #statusText{color:var(--dim);font-size:12px;letter-spacing:1px}
 #epLabel{color:var(--dim);font-size:11px;letter-spacing:1px;border:1px solid var(--line);padding:2px 8px;margin-left:10px}
+#beatStrip{border-bottom:1px solid var(--line);background:#0d1219;padding:7px 14px;font-size:11px;color:var(--dim);letter-spacing:.5px}
+#beatStrip b{color:var(--pink);letter-spacing:1px;margin-right:8px}
+.beatsheet{border:1px solid var(--pink);padding:10px 12px;margin:0 0 14px;background:#0d0b12}
+.beatHead{color:var(--pink);font-size:10px;letter-spacing:2px;margin-bottom:8px}
+.coldOpen{color:var(--dim);font-size:11px;font-style:italic;margin-bottom:8px;padding-left:8px;border-left:2px solid var(--line)}
+.beat{font-size:11px;color:var(--fg);padding:4px 8px;border-left:2px solid var(--line);margin-bottom:3px;line-height:1.5}
+.beat.on{border-left-color:var(--pink);background:#150f1c}
+.beat b{color:var(--pink);letter-spacing:1px;margin-right:6px}
+.beatTag{color:var(--dim);font-size:10px;letter-spacing:.5px;margin-top:2px}
+.beatGate{display:flex;gap:8px;margin-top:10px}
+.beatGate .b{flex:1;margin:0}
 .turn.proposed .txt{text-decoration:line-through;opacity:.5;border-left-color:var(--orange)!important}
 .turn.proposed .who{opacity:.6}
 .cutWhy{color:var(--orange);font-size:10px;letter-spacing:1px;margin-right:8px}
@@ -1492,6 +1634,7 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
         <option value="omnivoice">OMNIVOICE — designed voiceprints, one per character</option>
         <option value="piper">PIPER — local .onnx voices (offline fallback)</option>
       </select>
+      <label class="chk"><input type="checkbox" id="writersRoom"> WRITERS ROOM — INKWELL beat sheet, approved before the run</label>
       <label class="chk"><input type="checkbox" id="simMode"> SIMULATION MODE (no API — canned lines)</label>
       <button class="b" id="btnPing" style="width:100%;margin-top:9px" onclick="pingEndpoint()">TEST CONNECTION</button>
       <div id="pingOut" style="font-size:11px;color:var(--dim);margin-top:6px;word-break:break-all"></div>
@@ -1499,6 +1642,7 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
   </div>
   <!-- ================= FEED ================= -->
   <div id="center">
+    <div id="beatStrip" style="display:none"></div>
     <div id="feed"><div class="sysline">— awaiting initialization —</div></div>
     <div id="bar">
       <div id="humanBox">
@@ -1582,6 +1726,7 @@ const S = {
   epId:null,               // episode being tailed
   busAt:0,                 // bus offset we have consumed
   editorPass:false,        // SPLICE is working — keep tailing past the end of the run
+  beats:[], coldOpen:'', beatAt:0, beatGateOpen:false,  // INKWELL's beat sheet for the current episode
   replay:false,            // tailing a finished episode read-only
   tailTimer:null,
   awaiting:null,           // the human turn currently blocking the server loop
@@ -1931,7 +2076,10 @@ function renderTurn(t){
 }
 function rerenderFeed(){
   $('feed').innerHTML='';
+  if (S.beats.length) renderBeatsheet(S.beatGateOpen);   // the sheet stays pinned above the cut
   S.transcript.forEach(renderTurn);
+  if (S.beatAt) document.querySelectorAll('#beatsheet .beat').forEach(e=>
+    e.classList.toggle('on', +e.dataset.n === S.beatAt));
 }
 async function delTurn(seq){
   const i = S.transcript.findIndex(t=>t.seq===seq); if (i<0) return;
@@ -2002,6 +2150,11 @@ function applyEvent(ev){
     if (b.op==='cut'){ const i=S.transcript.findIndex(t=>t.seq===b.seq); if(i>=0){ S.transcript.splice(i,1); rerenderFeed(); } }
     else if (b.op==='edit' || b.op==='retake'){ const t=S.transcript.find(t=>t.seq===b.seq); if(t){ t.text=b.text; rerenderFeed(); } }
     else if (b.op==='keep'){ const t=S.transcript.find(t=>t.seq===b.seq); if(t){ delete t.proposal; rerenderFeed(); } }
+    else if (b.op==='writers_room_start'){ sysline(`— ${b.writer||'INKWELL'} IS IN THE ROOM${b.bible?' (bible in hand)':''} —`); thinking('INKWELL','var(--pink)'); }
+    else if (b.op==='beat'){ S.beatAt = b.n; showBeat(b); }
+    else if (b.op==='beatsheet_approved'){ unthink(); sysline('— BEAT SHEET APPROVED —'); markBeatsheetSettled(); }
+    else if (b.op==='beatsheet_skipped'){ unthink(); sysline('— RUNNING WITHOUT THE BEAT SHEET —'); S.beats=[]; markBeatsheetSettled(); }
+    else if (b.op==='writers_room_done'){ unthink(); log(`writers room: ${b.beats} beats${b.why?' ('+b.why+')':''}`); }
     else if (b.op==='editor_pass_start'){ sysline(`— ${b.editor||'SPLICE'} IS IN THE ROOM (${b.lines} lines) —`); thinking('SPLICE','var(--orange)'); }
     else if (b.op==='editor_pass_done'){
       unthink(); S.editorPass=false;
@@ -2019,6 +2172,20 @@ function applyEvent(ev){
   }
   else if (ev.type==='artifact' && b.kind==='plan'){
     log(`${S.epId}: ${b.turns} turns planned`);
+  }
+  else if (ev.type==='artifact' && b.kind==='beatsheet'){
+    unthink();
+    S.beats = b.beats||[]; S.coldOpen = b.cold_open||'';
+    renderBeatsheet(false);
+    log(`beat sheet: ${S.beats.length} beats (${b.file})`);
+  }
+  else if (ev.type==='approval_request' && b.kind==='beatsheet_approval'){
+    S.beatGateOpen = !S.replay;
+    if (!S.replay) renderBeatsheet(true);
+    setStatus('AWAITING BEAT SHEET APPROVAL','wait');
+  }
+  else if (ev.type==='artifact' && b.kind==='locked_cut'){
+    log(`locked cut: ${b.turns} lines`);
   }
 }
 async function pollBus(){
@@ -2038,7 +2205,9 @@ async function pollBus(){
 function startTail(id, replay){
   clearTimeout(S.tailTimer);
   S.epId=id; S.busAt=0; S.replay=!!replay; S.transcript=[]; S.awaiting=null;
-  $('feed').innerHTML=''; $('epLabel').textContent = id + (replay?' (replay)':'');
+  S.beats=[]; S.coldOpen=''; S.beatAt=0; S.beatGateOpen=false;
+  $('feed').innerHTML=''; $('beatStrip').style.display='none';
+  $('epLabel').textContent = id + (replay?' (replay)':'');
   pollBus();
 }
 function endRun(){
@@ -2090,6 +2259,7 @@ async function initialize(){
       body:JSON.stringify({
         format:S.format, topic, rounds:parseInt($('rounds').value)||4,
         cast, humans:humans(), sim:$('simMode').checked,
+        writers_room:$('writersRoom').checked,
         endpoint:$('endpoint').value.trim(), api_key:$('apikey').value,
         model:$('model').value.trim(), temperature:parseFloat($('temp').value)||0.5,
       })});
@@ -2147,6 +2317,46 @@ async function reroll(seq){
     await busEvent('retake', {seq, text});           // the retake is on the record
   }catch(e){ log('RE-ROLL ERROR: '+e.message); }
   unthink();
+}
+
+/* ---------------------------------------------------------------- 3.2 INKWELL: the beat sheet */
+function renderBeatsheet(withGate){
+  let el = $('beatsheet');
+  if (!el){
+    el = document.createElement('div'); el.id='beatsheet'; el.className='beatsheet';
+    $('feed').appendChild(el);
+  }
+  const beats = S.beats.map(b=>`
+    <div class="beat" data-n="${b.n}">
+      <b>BEAT ${b.n}</b> ${esc(b.beat)}
+      ${b.collision?`<div class="beatTag">⚡ COLLISION: ${esc(b.collision)}</div>`:''}
+      ${b.callback?`<div class="beatTag">↩ CALLBACK: ${esc(b.callback)}</div>`:''}
+    </div>`).join('');
+  el.innerHTML = `
+    <div class="beatHead">✎ BEAT SHEET — INKWELL${S.coldOpen?'':''}</div>
+    ${S.coldOpen?`<div class="coldOpen">COLD OPEN: ${esc(S.coldOpen)}</div>`:''}
+    ${beats}
+    ${withGate?`<div class="beatGate">
+        <button class="b go" onclick="approveBeatsheet(true)">✓ APPROVE — SHOOT IT</button>
+        <button class="b" onclick="approveBeatsheet(false)">✕ RUN WITHOUT IT</button>
+      </div>`:''}`;
+  $('feed').scrollTop = 1e9;
+}
+function markBeatsheetSettled(){
+  S.beatGateOpen = false;
+  const g = document.querySelector('#beatsheet .beatGate');
+  if (g) g.remove();
+}
+function showBeat(b){
+  $('beatStrip').style.display = 'block';
+  $('beatStrip').innerHTML = `<b>BEAT ${b.n}/${b.of}</b> ${esc(b.beat)}`;
+  document.querySelectorAll('#beatsheet .beat').forEach(e=>
+    e.classList.toggle('on', +e.dataset.n === b.n));
+}
+async function approveBeatsheet(ok){
+  markBeatsheetSettled();
+  await fetch('/api/episode/approve',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:S.epId, kind:'beatsheet', ok})});
 }
 
 /* ---------------------------------------------------------------- 3.1 SPLICE: the editor pass */
@@ -2589,8 +2799,8 @@ def headless(argv: list) -> int:
         print("headless needs a --topic (or an --episode whose brief has one)")
         return 1
     res = start_episode({"format": fmt, "topic": topic, "rounds": rounds, "cast": cast,
-                         "humans": [], "sim": sim, "endpoint": DEFAULT_ENDPOINT,
-                         "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL})
+                         "humans": [], "sim": sim, "writers_room": "--writers-room" in argv,
+                         "endpoint": DEFAULT_ENDPOINT, "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL})
     if not res.get("ok"):
         print("could not start:", res.get("error"))
         return 1
@@ -2609,6 +2819,15 @@ def headless(argv: list) -> int:
                 print(f"  -- {ev['body'].get('name')} skipped (headless)")
                 ep.human_text = None
                 ep.human_gate.set()
+            elif ev["type"] == "approval_request" and ev["body"].get("kind") == "beatsheet_approval":
+                print(f"  -- beat sheet approved unattended ({ev['body'].get('beats')} beats)")
+                ep.approval_ok = True
+                ep.approval_gate.set()
+            elif ev["type"] == "artifact" and ev["body"].get("kind") == "beatsheet":
+                if ev["body"].get("cold_open"):
+                    print(f"  -- COLD OPEN: {ev['body']['cold_open']}")
+                for b in ev["body"].get("beats", []):
+                    print(f"     beat {b['n']}: {b['beat']}")
             elif ev["type"] == "note":
                 print(f"  -- note: {ev['body']}")
         if ep.meta.get("state") in ("post", "rendered"):

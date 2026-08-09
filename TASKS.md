@@ -32,9 +32,9 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Merge, tag phase-3.1
 
 ## Phase 3.2 — INKWELL the head writer (branch: p3-2-inkwell)
-- [ ] Pre-run pass: INKWELL reads episodes/ep-NNN/brief.md + `<show>/SERIES_BIBLE.md` → writes beatsheet.md (beats, planned collisions, callback slots, cold open)
-- [ ] Stage manager feeds the current beat into each turn's instruction
-- [ ] UI: beat sheet visible during run; approval gate before the run starts (approval_request on the bus)
+- [x] Pre-run pass: INKWELL reads episodes/ep-NNN/brief.md + `<show>/SERIES_BIBLE.md` → writes beatsheet.md (beats, planned collisions, callback slots, cold open)
+- [x] Stage manager feeds the current beat into each turn's instruction
+- [x] UI: beat sheet visible during run; approval gate before the run starts (approval_request on the bus)
 - [ ] Merge, tag phase-3.2
 
 ## Phase 3.3 — CANON.LOCK the archivist (branch: p3-3-canon-lock)
