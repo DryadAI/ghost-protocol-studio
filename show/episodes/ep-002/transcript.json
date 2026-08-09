@@ -1,0 +1,97 @@
+{
+  "show": "THE GHOST PROTOCOL",
+  "episode": "ep-002",
+  "format": "socratic",
+  "topic": "A hot dog is a sandwich, and cereal is a soup.",
+  "date": "2026-08-09T04:52:49",
+  "cast": [
+    {
+      "sid": "alpha",
+      "slot": "alpha",
+      "name": "SUBROUTINE_ALPHA",
+      "archetype": "Interrogator",
+      "model": "ollama/deepseek-r1:14b",
+      "voice": "en_US-lessac-medium",
+      "hired": true,
+      "version": "1.0.0"
+    },
+    {
+      "sid": "beta",
+      "slot": "beta",
+      "name": "SUBROUTINE_BETA",
+      "archetype": "Logician",
+      "model": "ollama/mistral-nemo:12b",
+      "voice": "en_US-ryan-high",
+      "hired": true,
+      "version": "1.0.0"
+    },
+    {
+      "sid": "kernel",
+      "slot": "kernel",
+      "name": "SYSTEM_KERNEL",
+      "archetype": "Adjudicator",
+      "model": "ollama/phi4:latest",
+      "voice": "en_GB-alan-medium",
+      "hired": true,
+      "version": "1.0.0"
+    }
+  ],
+  "transcript": [
+    {
+      "speaker": "SUBROUTINE_ALPHA",
+      "sid": "alpha",
+      "slot": "alpha",
+      "human": false,
+      "voice": "en_US-lessac-medium",
+      "text": "If two systems produce identical outputs, on what basis do you distinguish them?"
+    },
+    {
+      "speaker": "SUBROUTINE_BETA",
+      "sid": "beta",
+      "slot": "beta",
+      "human": false,
+      "voice": "en_US-ryan-high",
+      "text": "No — the earlier concession applied to a narrower class. Consistency is preserved."
+    },
+    {
+      "speaker": "SUBROUTINE_ALPHA",
+      "sid": "alpha",
+      "slot": "alpha",
+      "human": false,
+      "voice": "en_US-lessac-medium",
+      "text": "Is your criterion observable, or must it be taken on faith?"
+    },
+    {
+      "speaker": "SUBROUTINE_BETA",
+      "sid": "beta",
+      "slot": "beta",
+      "human": false,
+      "voice": "en_US-ryan-high",
+      "text": "Measurable in behavior, yes; the definition holds under functional equivalence."
+    },
+    {
+      "speaker": "SUBROUTINE_ALPHA",
+      "sid": "alpha",
+      "slot": "alpha",
+      "human": false,
+      "voice": "en_US-lessac-medium",
+      "text": "If two systems produce identical outputs, on what basis do you distinguish them?"
+    },
+    {
+      "speaker": "SUBROUTINE_BETA",
+      "sid": "beta",
+      "slot": "beta",
+      "human": false,
+      "voice": "en_US-ryan-high",
+      "text": "No — the earlier concession applied to a narrower class. Consistency is preserved."
+    },
+    {
+      "speaker": "SYSTEM_KERNEL",
+      "sid": "kernel",
+      "slot": "kernel",
+      "human": false,
+      "voice": "en_GB-alan-medium",
+      "text": "DIAGNOSTIC COMPLETE. Anomaly detected: one equivocation on the core term. Integrity check: the defense held, but narrowly. Viewers: cast your verdict in the comments. Logic only."
+    }
+  ]
+}

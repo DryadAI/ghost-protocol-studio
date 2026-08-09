@@ -16,13 +16,13 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Merge, tag phase-1
 
 ## Phase 2 — Stage manager + bus (branch: p2-stage-manager)
-- [ ] Server-side episode runner: POST /api/episode/start {format, topic, rounds, cast, humans} creates `<show>/episodes/ep-NNN/`
-- [ ] Every event appended to episodes/ep-NNN/bus.jsonl as {ts, from, to, type, ref, body}; types: line, note, retake, artifact, panel, approval_request, state
-- [ ] Episode state machine: brief → running → awaiting_human → post → rendered; transitions logged on the bus
-- [ ] UI becomes a bus tailer (polling is fine); human turns block server loop until POST /api/episode/input
-- [ ] Replay: GET /api/episode/<id>/bus loads any past episode read-only; transcript.json derived from bus
-- [ ] Headless: `python3 ghost_protocol_studio.py --episode <id> --run` (works in Simulation Mode)
-- [ ] Acceptance: kill browser mid-run, reopen, feed resumes; replay a finished episode; one headless Simulation run completes
+- [x] Server-side episode runner: POST /api/episode/start {format, topic, rounds, cast, humans} creates `<show>/episodes/ep-NNN/`
+- [x] Every event appended to episodes/ep-NNN/bus.jsonl as {ts, from, to, type, ref, body}; types: line, note, retake, artifact, panel, approval_request, state
+- [x] Episode state machine: brief → running → awaiting_human → post → rendered; transitions logged on the bus
+- [x] UI becomes a bus tailer (polling is fine); human turns block server loop until POST /api/episode/input
+- [x] Replay: GET /api/episode/<id>/bus loads any past episode read-only; transcript.json derived from bus
+- [x] Headless: `python3 ghost_protocol_studio.py --episode <id> --run` (works in Simulation Mode)
+- [x] Acceptance: kill browser mid-run, reopen, feed resumes; replay a finished episode; one headless Simulation run completes
 - [ ] Merge, tag phase-2
 
 ## Phase 3.1 — SPLICE the editor (branch: p3-1-splice)
