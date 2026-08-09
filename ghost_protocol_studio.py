@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 import urllib.request
@@ -204,7 +205,7 @@ def scan_show(show_dir: str = None) -> dict:
     """Rescan the show dir on every call — editing a SOUL.md must change the next run,
     with no server restart."""
     show_dir = SHOW_DIR if show_dir is None else show_dir
-    out = {"show": show_dir, "cast": [], "crew": [], "bible": False}
+    out = {"show": show_dir, "cast": [], "crew": [], "bible": False, "slots": FORMAT_SLOTS}
     if not show_dir or not os.path.isdir(show_dir):
         return out
     out["bible"] = os.path.isfile(os.path.join(show_dir, "SERIES_BIBLE.md"))
@@ -218,6 +219,81 @@ def scan_show(show_dir: str = None) -> dict:
                 m = load_member(mdir, kind)
                 if m:
                     out[key].append(m)
+    return out
+
+
+# Every format is a set of chairs. A hire qualifies for one when their card.json
+# lists the format and their role matches. Defined here and served over /api/cast so
+# the browser's casting picker and the headless runner can never drift apart.
+FORMAT_SLOTS = {
+    "socratic": [{"id": "alpha", "label": "INTERROGATOR", "roles": ["interrogator"]},
+                 {"id": "beta", "label": "DEFENDER", "roles": ["defender"]},
+                 {"id": "kernel", "label": "ADJUDICATOR", "roles": ["judge", "adjudicator"]}],
+    "roundtable": [{"id": "p7", "label": "PANEL SEAT 1", "roles": ["panelist"]},
+                   {"id": "mira", "label": "PANEL SEAT 2", "roles": ["panelist"]},
+                   {"id": "cynic", "label": "PANEL SEAT 3", "roles": ["panelist"]},
+                   {"id": "kernel", "label": "ADJUDICATOR", "roles": ["judge", "adjudicator"]}],
+    "tribunal": [{"id": "pros", "label": "PROSECUTION", "roles": ["prosecutor", "prosecution"]},
+                 {"id": "def", "label": "DEFENSE", "roles": ["defense counsel", "defense", "defence"]},
+                 {"id": "acc", "label": "ACCUSED", "roles": ["accused", "subject"]},
+                 {"id": "kernel", "label": "JUDGE", "roles": ["judge", "adjudicator"]}],
+    "triad": [{"id": "stoic", "label": "PHILOSOPHER 1", "roles": ["philosopher"]},
+              {"id": "nihil", "label": "PHILOSOPHER 2", "roles": ["philosopher"]},
+              {"id": "util", "label": "PHILOSOPHER 3", "roles": ["philosopher"]},
+              {"id": "synth", "label": "SYNTHESIZER", "roles": ["synthesizer"]}],
+}
+
+
+def qualifies(member: dict, fmt: str, slot: dict) -> bool:
+    roles = [r.strip().lower() for r in re.split(r"[/,]", member.get("role", "")) if r.strip()]
+    return fmt in (member.get("formats") or []) and any(r in slot["roles"] for r in roles)
+
+
+def builtin_members() -> list:
+    """characters.json as member records. The engine's own cast — what fills a chair
+    nobody was hired into, so a bare checkout still runs an episode."""
+    out = []
+    for c in CHARACTERS:
+        color = c.get("color") or "#8be9fd"
+        out.append({"sid": c.get("sid"), "name": c.get("name", ""), "role": c.get("role", ""),
+                    "formats": c.get("formats", []), "archetype": c.get("archetype", ""),
+                    "humor_style": c.get("humor_style", ""), "color": color,
+                    "hex": "0x" + color.lstrip("#"), "model_recommendation": c.get("aiModel", ""),
+                    "piper_voice": c.get("piperVoice") or c.get("voice", ""),
+                    "sys": c.get("systemPrompt", ""), "hired": False, "version": ""})
+    return out
+
+
+def _seat(member: dict, slot_id: str) -> dict:
+    return dict(member, slot=slot_id, ovoice=member["sid"], voice=member.get("piper_voice", ""),
+                model=member.get("model_recommendation", ""))
+
+
+def cast_for_format(fmt: str, hired: list) -> list:
+    """Auto-cast hires into chairs — the headless equivalent of the UI's picker.
+    Prefers the member whose sid IS the chair (the charter cast lands in its own seats),
+    then fills whatever is left from the built-in cast."""
+    slots = FORMAT_SLOTS.get(fmt, [])
+    pools = {s["id"]: [m for m in hired if qualifies(m, fmt, s)] for s in slots}
+    by_sid = {m["sid"]: m for m in hired}
+    chosen, taken = {}, set()
+    for s in slots:
+        if any(m["sid"] == s["id"] for m in pools[s["id"]]):
+            chosen[s["id"]] = s["id"]
+            taken.add(s["id"])
+    for s in slots:
+        if s["id"] in chosen:
+            continue
+        m = next((m for m in pools[s["id"]] if m["sid"] not in taken), None)
+        if m:
+            chosen[s["id"]] = m["sid"]
+            taken.add(m["sid"])
+    builtin = {m["sid"]: m for m in builtin_members()}
+    out = []
+    for s in slots:
+        m = by_sid.get(chosen.get(s["id"])) or builtin.get(s["id"])
+        if m:
+            out.append(_seat(m, s["id"]))
     return out
 
 
@@ -641,6 +717,352 @@ def render_episode(payload: dict) -> dict:
     return {"ok": True, "file": out_name, "url": f"/renders/{out_name}", "size_mb": size_mb}
 
 
+# =============================================================================
+#  THE BUS — an episode is a replayable directory, not a browser session
+#
+#  Everything that happens in an episode is one append-only line in
+#  <show>/episodes/ep-NNN/bus.jsonl:  {ts, from, to, type, ref, body}
+#  The browser is a tailer: it polls for events after an offset and draws them.
+#  Kill the browser mid-run and the episode keeps going on the server; reopen and
+#  the feed resumes from the bus. transcript.json is *derived* from the bus, so
+#  edits and cuts are events too, not destructive mutations of a live array.
+# =============================================================================
+BUS_TYPES = ("line", "note", "retake", "artifact", "panel", "approval_request", "state")
+STATES = ("brief", "running", "awaiting_human", "post", "rendered")
+EPISODES_DIR = os.path.join(SHOW_DIR or BASE_DIR, "episodes")
+KERNEL_SIDS = ("kernel", "synth")  # chairs that close a show rather than sit on the panel
+
+
+class Episode:
+    """One episode directory, its bus, and (while running) its live loop."""
+
+    def __init__(self, eid: str, path: str, meta: dict):
+        self.id, self.path, self.meta = eid, path, meta
+        self.lock = threading.Lock()
+        self.events = []                      # mirrors bus.jsonl
+        self.human_gate = threading.Event()   # set by /api/episode/input
+        self.human_text = None
+        self.abort = threading.Event()
+        self.runtime = {}                     # endpoint/api_key/etc — memory only, never on disk
+
+    # -- persistence ---------------------------------------------------------
+    @property
+    def bus_path(self):
+        return os.path.join(self.path, "bus.jsonl")
+
+    @property
+    def meta_path(self):
+        return os.path.join(self.path, "episode.json")
+
+    def save_meta(self):
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            json.dump(self.meta, f, indent=2, ensure_ascii=False)
+
+    def load(self):
+        self.events = []
+        try:
+            with open(self.bus_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self.events.append(json.loads(line))
+        except (OSError, json.JSONDecodeError):
+            pass
+        return self
+
+    # -- the bus -------------------------------------------------------------
+    def emit(self, frm: str, typ: str, body, to: str = "*", ref: str = "") -> dict:
+        ev = {"seq": 0, "ts": time.time(), "from": frm, "to": to, "type": typ, "ref": ref, "body": body}
+        with self.lock:
+            ev["seq"] = len(self.events)
+            self.events.append(ev)
+            with open(self.bus_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        return ev
+
+    def since(self, offset: int) -> list:
+        with self.lock:
+            return self.events[max(0, offset):]
+
+    def set_state(self, state: str, note: str = ""):
+        self.meta["state"] = state
+        self.meta["updated"] = time.time()
+        self.save_meta()
+        self.emit("stage_manager", "state", {"state": state, "note": note})
+
+    # -- derived views -------------------------------------------------------
+    def transcript(self) -> list:
+        """Replay the bus into the current cut: lines, with edits applied and cuts removed."""
+        lines, dropped = {}, set()
+        for ev in list(self.events):
+            if ev["type"] == "line":
+                lines[ev["seq"]] = dict(ev["body"], seq=ev["seq"])
+            elif ev["type"] == "note" and ev["body"].get("op") in ("edit", "cut"):
+                ref = ev["body"].get("seq")
+                if ev["body"]["op"] == "cut":
+                    dropped.add(ref)
+                elif ref in lines:
+                    lines[ref]["text"] = ev["body"].get("text", lines[ref]["text"])
+            elif ev["type"] == "retake" and ev["body"].get("seq") in lines:
+                lines[ev["body"]["seq"]]["text"] = ev["body"].get("text", "")
+        return [lines[k] for k in sorted(lines) if k not in dropped]
+
+    def summary(self) -> dict:
+        return {"id": self.id, "state": self.meta.get("state", "brief"),
+                "format": self.meta.get("format", ""), "topic": self.meta.get("topic", ""),
+                "created": self.meta.get("created", 0), "updated": self.meta.get("updated", 0),
+                "turns": len(self.transcript()), "events": len(self.events)}
+
+
+EPISODES = {}          # id -> Episode, for the ones this process has touched
+EPISODES_LOCK = threading.Lock()
+
+
+def next_episode_id() -> str:
+    os.makedirs(EPISODES_DIR, exist_ok=True)
+    used = [int(m.group(1)) for d in os.listdir(EPISODES_DIR)
+            for m in [re.fullmatch(r"ep-(\d+)", d)] if m]
+    return f"ep-{max(used, default=0) + 1:03d}"
+
+
+def get_episode(eid: str) -> "Episode":
+    """From memory, else from disk. Path-guarded on the id."""
+    if not re.fullmatch(r"ep-\d+", eid or ""):
+        return None
+    with EPISODES_LOCK:
+        if eid in EPISODES:
+            return EPISODES[eid]
+    path = os.path.join(EPISODES_DIR, eid)
+    if not os.path.isdir(path):
+        return None
+    try:
+        with open(os.path.join(path, "episode.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        meta = {"state": "brief"}
+    ep = Episode(eid, path, meta).load()
+    with EPISODES_LOCK:
+        return EPISODES.setdefault(eid, ep)
+
+
+def list_episodes() -> list:
+    if not os.path.isdir(EPISODES_DIR):
+        return []
+    out = []
+    for d in sorted(os.listdir(EPISODES_DIR), reverse=True):
+        ep = get_episode(d)
+        if ep:
+            out.append(ep.summary())
+    return out
+
+
+# =============================================================================
+#  THE STAGE MANAGER — turn planning and the run loop, server-side.
+#  This is CALLSHEET's job, ported out of the browser: the plan is built here,
+#  every turn is emitted here, and human turns block this loop (not a JS promise)
+#  until POST /api/episode/input arrives.
+# =============================================================================
+def build_plan(fmt: str, topic: str, rounds: int, cast: list, humans: list) -> list:
+    """Plans address chairs (slot ids), never people — whoever is cast answers."""
+    def chair(c):
+        return c.get("slot") or c.get("sid")
+
+    P = []
+    if fmt == "socratic":
+        P.append({"sid": "alpha", "inst": f'The thesis under audit is: "{topic}". Issue your first interrogative probe.'})
+        for r in range(1, rounds + 1):
+            P.append({"sid": "beta", "inst": f"Answer the audit engine's last probe directly. (round {r}/{rounds})"})
+            if r < rounds:
+                P.append({"sid": "alpha", "inst": f"Continue the audit. Tighten the trap with your next probe. (round {r + 1}/{rounds})"})
+        P.append({"sid": "kernel", "inst": "The stress-test is complete. Produce the diagnostic wrap-up."})
+    elif fmt == "roundtable":
+        ais = [c for c in cast if chair(c) != "kernel"]
+        if not ais:
+            return []
+        P.append({"sid": chair(ais[0]), "inst": f'Open the round table on: "{topic}". Give your take in your persona, and welcome the panel.'})
+        for r in range(1, rounds + 1):
+            for ix, a in enumerate(ais):
+                if r == 1 and ix == 0:
+                    continue
+                P.append({"sid": chair(a), "inst": f"React to the discussion so far and push it forward. (round {r}/{rounds})"})
+            for h in humans:
+                P.append({"human": h, "inst": f"Round {r}: jump in — a joke, a jab, a curveball question. The AIs will riff on whatever you say."})
+        P.append({"sid": "kernel", "inst": "The panel is done. Deliver the closing recap and BEST LINE OF THE NIGHT."})
+    elif fmt == "tribunal":
+        witness = next((c for c in cast if chair(c) == "witness"), None)
+        P.append({"sid": "pros", "inst": f'Deliver your OPENING STATEMENT against the thesis on trial: "{topic}".'})
+        P.append({"sid": "def", "inst": "Deliver your OPENING STATEMENT in defense of the thesis."})
+        for r in range(1, rounds + 1):
+            P.append({"sid": "pros", "inst": f"EXAMINATION round {r}/{rounds}: put one sharp question to the accused, SUBJECT-X."})
+            P.append({"sid": "acc", "inst": "Answer the prosecution's question directly, consistent with your prior testimony."})
+            P.append({"sid": "def", "inst": "Brief rebuttal: repair any damage from that exchange, or reinforce your client's answer."})
+        if witness:
+            P.append({"sid": "pros", "inst": f"Call {witness.get('name', 'the witness')} to the stand and put your first question to them about the case."})
+            P.append({"sid": "witness", "inst": "Answer the prosecution's question directly and honestly, drawing on your background."})
+            P.append({"sid": "def", "inst": "Cross-examine the witness: one pointed question, or challenge their credibility or reliability."})
+            P.append({"sid": "witness", "inst": "Answer the defense's question directly and honestly, staying consistent with your prior answer."})
+        P.append({"sid": "pros", "inst": "Deliver your CLOSING STATEMENT."})
+        P.append({"sid": "def", "inst": "Deliver your CLOSING STATEMENT."})
+        P.append({"sid": "kernel", "inst": "Court is adjourned. Deliver the ruling."})
+        P.append({"human": {"sid": "jury", "name": "HUMAN JURY", "color": "var(--yellow)", "hex": "0xf1fa8c",
+                            "voice": "en_US-joe-medium", "ovoice": "host1", "human": True},
+                  "inst": "The floor is yours, jury: type your one-line verdict (or SKIP)."})
+    elif fmt == "triad":
+        for r in range(1, rounds + 1):
+            for sid in ("stoic", "nihil", "util"):
+                P.append({"sid": sid, "inst": (f'Open the triad on: "{topic}". State your school\'s position.'
+                                               if r == 1 and sid == "stoic"
+                                               else f"Respond through your school's lens; engage the previous speakers directly. (round {r}/{rounds})")})
+        P.append({"sid": "synth", "inst": "The triad is complete. Forge the synthesis."})
+    return P
+
+
+# Canned lines for Simulation Mode. Ported from the browser so a headless run
+# needs no network at all — invariant 3 holds server-side too.
+SIM_LINES = {
+    "q": ["Define your central term. Is it measurable, yes or no?",
+          "If two systems produce identical outputs, on what basis do you distinguish them?",
+          "You conceded X earlier. Does that not contradict your last answer?",
+          "Is your criterion observable, or must it be taken on faith?"],
+    "a": ["Measurable in behavior, yes; the definition holds under functional equivalence.",
+          "Distinction rests on internal architecture, not output parity. No contradiction arises.",
+          "No — the earlier concession applied to a narrower class. Consistency is preserved.",
+          "Observable via sustained self-referential behavior across contexts."],
+    "c": ["Statistically speaking, this panel is the most optimistic thing in the room, and that is not a compliment.",
+          "Every silver lining I have audited turned out to be the lining of a much larger cloud."],
+    "o": ["This is actually a huge opportunity! Imagine scaling that idea to eight billion people.",
+          "I love this topic so much I've already drafted three utopias about it."],
+    "l": ["Noted. I have taken the joke literally and filed it under 'facts'. The topic remains unresolved.",
+          "Clarification: that was hyperbole. I have adjusted my confidence accordingly, to 41 percent."],
+    "s": ["Virtue does not depend on substrate. What matters is whether the agent can act with reason and duty.",
+          "The wise mind concerns itself with what it can govern: its judgments."],
+    "n": ["'Person' is a word we invented to feel important. You are arguing about the label on an empty box.",
+          "Meaning is not discovered here, it is manufactured — and the factory is on fire."],
+    "u": ["Grant rights where doing so maximizes aggregate wellbeing. The ledger says yes.",
+          "Quantify it: expected harms of exclusion exceed costs of inclusion by any reasonable weighting."],
+    "k": ["DIAGNOSTIC COMPLETE. Anomaly detected: one equivocation on the core term. Integrity check: the defense "
+          "held, but narrowly. Viewers: cast your verdict in the comments. Logic only."],
+}
+SIM_BY_ARCHETYPE = {"interrogator": "q", "devil's advocate": "q", "logician": "a", "pragmatist": "a",
+                    "diplomat": "a", "skeptic": "c", "idealist": "o", "literalist": "l", "stoic": "s",
+                    "nihilist": "n", "utilitarian": "u", "adjudicator": "k", "synthesizer": "k"}
+SIM_BY_SLOT = {"alpha": "q", "pros": "q", "beta": "a", "acc": "a", "def": "a", "witness": "a",
+               "cynic": "c", "mira": "o", "p7": "l", "stoic": "s", "nihil": "n", "util": "u"}
+
+
+def sim_line(spk: dict, n: int) -> str:
+    bank = SIM_LINES[SIM_BY_ARCHETYPE.get((spk.get("archetype") or "").lower().strip())
+                     or SIM_BY_SLOT.get(spk.get("slot") or spk.get("sid"), "k")]
+    return bank[n % len(bank)]
+
+
+def build_messages(spk: dict, inst: str, topic: str, transcript: list) -> list:
+    lines = "\n\n".join(f"{t['name']}: {t['text']}" for t in transcript)
+    user = ((f"TRANSCRIPT SO FAR:\n{lines}\n\n" if lines else "")
+            + f"TOPIC: {topic}\n\nYOUR TASK NOW: {inst}\n\n"
+            + "Respond with ONLY your spoken line(s). Do not prefix your own name. Stay in character.")
+    return [{"role": "system", "content": spk.get("sys", "")}, {"role": "user", "content": user}]
+
+
+def run_episode(ep: "Episode"):
+    """The run loop. Lives on the server, so the browser is optional from here on."""
+    meta, rt = ep.meta, ep.runtime
+    cast = {(c.get("slot") or c.get("sid")): c for c in meta["cast"]}
+    plan = build_plan(meta["format"], meta["topic"], meta["rounds"], meta["cast"], meta.get("humans", []))
+    ep.emit("stage_manager", "artifact", {"kind": "plan", "turns": len(plan)})
+    ep.set_state("running", f"{len(plan)} turns planned")
+    sim_n = 0
+    try:
+        for step in plan:
+            if ep.abort.is_set():
+                break
+            if step.get("human"):
+                h = step["human"]
+                ep.set_state("awaiting_human", h["name"])
+                ep.emit("stage_manager", "approval_request",
+                        {"kind": "human_turn", "sid": h["sid"], "name": h["name"], "inst": step["inst"]})
+                ep.human_gate.clear()
+                while not ep.human_gate.wait(0.5):
+                    if ep.abort.is_set():
+                        break
+                if ep.abort.is_set():
+                    break
+                ep.set_state("running")
+                if ep.human_text:
+                    ep.emit(h["sid"], "line", {**h, "human": True, "text": ep.human_text, "inst": step["inst"]})
+                ep.human_text = None
+                continue
+            spk = cast.get(step["sid"])
+            if not spk:
+                ep.emit("stage_manager", "note", {"op": "skip", "sid": step["sid"], "why": "no one cast in this chair"})
+                continue
+            if rt.get("sim"):
+                sim_n += 1
+                text = sim_line(spk, sim_n)
+                time.sleep(0.35)
+            else:
+                res = proxy_chat({"endpoint": rt.get("endpoint"), "api_key": rt.get("api_key"),
+                                  "model": spk.get("model") or rt.get("model"),
+                                  "temperature": rt.get("temperature", 0.5),
+                                  "messages": build_messages(spk, step["inst"], meta["topic"], ep.transcript())})
+                if not res.get("ok"):
+                    ep.emit("stage_manager", "note", {"op": "error", "sid": step["sid"], "why": res.get("error", "")})
+                    break
+                text = re.sub(r"^" + re.escape(spk.get("name", "")) + r"\s*:\s*", "", res["text"].strip(), flags=re.I)
+            ep.emit(spk.get("sid", step["sid"]), "line",
+                    {"sid": spk.get("sid"), "slot": spk.get("slot") or step["sid"], "name": spk.get("name"),
+                     "color": spk.get("color"), "hex": spk.get("hex"), "voice": spk.get("voice"),
+                     "ovoice": spk.get("ovoice"), "human": False, "text": text, "inst": step["inst"]})
+        ep.set_state("post", "aborted" if ep.abort.is_set() else "end of episode")
+    except Exception as e:  # noqa: BLE001 — a fault must land on the bus, not vanish into a thread
+        ep.emit("stage_manager", "note", {"op": "fault", "why": f"{type(e).__name__}: {e}"})
+        ep.set_state("post", "engine fault")
+    finally:
+        write_transcript(ep)
+
+
+def write_transcript(ep: "Episode"):
+    """transcript.json is derived from the bus, never authored directly."""
+    data = {"show": "THE GHOST PROTOCOL", "episode": ep.id, "format": ep.meta.get("format"),
+            "topic": ep.meta.get("topic"), "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "cast": [{k: c.get(k) for k in ("sid", "slot", "name", "archetype", "model", "voice", "hired", "version")}
+                     for c in ep.meta.get("cast", [])],
+            "transcript": [{"speaker": t.get("name"), "sid": t.get("sid"), "slot": t.get("slot"),
+                            "human": bool(t.get("human")), "voice": t.get("voice"), "text": t.get("text")}
+                           for t in ep.transcript()]}
+    with open(os.path.join(ep.path, "transcript.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return data
+
+
+def start_episode(body: dict) -> dict:
+    fmt = body.get("format", "socratic")
+    topic = (body.get("topic") or "").strip()
+    if not topic:
+        return {"ok": False, "error": "no topic"}
+    cast = body.get("cast") or []
+    if not cast:
+        return {"ok": False, "error": "no cast"}
+    with EPISODES_LOCK:      # two starts in the same second must not claim the same id
+        eid = next_episode_id()
+        path = os.path.join(EPISODES_DIR, eid)
+        os.makedirs(path, exist_ok=True)
+    meta = {"id": eid, "format": fmt, "topic": topic, "rounds": int(body.get("rounds") or 4),
+            "cast": cast, "humans": body.get("humans") or [], "sim": bool(body.get("sim")),
+            "show": SHOW_DIR, "created": time.time(), "updated": time.time(), "state": "brief"}
+    ep = Episode(eid, path, meta)
+    # Credentials stay in memory: an episode directory is committed to a repo.
+    ep.runtime = {"endpoint": body.get("endpoint"), "api_key": body.get("api_key"),
+                  "model": body.get("model"), "temperature": body.get("temperature", 0.5),
+                  "sim": bool(body.get("sim"))}
+    ep.save_meta()
+    with EPISODES_LOCK:
+        EPISODES[eid] = ep
+    ep.emit("stage_manager", "state", {"state": "brief", "note": f'"{topic}" / {fmt}'})
+    threading.Thread(target=run_episode, args=(ep,), daemon=True, name=f"run-{eid}").start()
+    return {"ok": True, "id": eid, "state": "brief"}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter logs
         if "/api/" in (args[0] if args else ""):
@@ -691,6 +1113,29 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, ctype, f.read())
             else:
                 self._send(404, "text/plain", b"not found")
+        elif self.path == "/api/episodes":
+            self._send(200, "application/json", json.dumps(list_episodes()).encode("utf-8"))
+        elif self.path.startswith("/api/episode/"):
+            rest = self.path[len("/api/episode/"):]
+            path, _, query = rest.partition("?")
+            eid, _, tail = path.partition("/")
+            ep = get_episode(eid)
+            if not ep:
+                self._send(404, "application/json", b'{"ok":false,"error":"no such episode"}')
+            elif tail == "bus":
+                offset = 0
+                for part in query.split("&"):
+                    if part.startswith("from="):
+                        offset = int(part[5:] or 0) if part[5:].isdigit() else 0
+                self._send(200, "application/json", json.dumps({
+                    "ok": True, "id": ep.id, "state": ep.meta.get("state"), "meta": ep.summary(),
+                    "events": ep.since(offset), "next": len(ep.events),
+                    "cast": ep.meta.get("cast", []), "live": ep.id in EPISODES and ep.meta.get("state") in ("brief", "running", "awaiting_human"),
+                }).encode("utf-8"))
+            elif tail == "transcript":
+                self._send(200, "application/json", json.dumps(write_transcript(ep)).encode("utf-8"))
+            else:
+                self._send(404, "application/json", b'{"ok":false,"error":"unknown episode route"}')
         elif self.path == "/api/defaults":
             self._send(200, "application/json", json.dumps({
                 "endpoint": DEFAULT_ENDPOINT, "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL,
@@ -721,6 +1166,29 @@ class Handler(BaseHTTPRequestHandler):
             out = proxy_models(body)
         elif self.path == "/api/render":
             out = render_episode(body)
+        elif self.path == "/api/episode/start":
+            out = start_episode(body)
+        elif self.path in ("/api/episode/input", "/api/episode/abort", "/api/episode/event"):
+            ep = get_episode(body.get("id", ""))
+            if not ep:
+                out = {"ok": False, "error": "no such episode"}
+            elif self.path == "/api/episode/input":
+                ep.human_text = (body.get("text") or "").strip() or None   # blank = SKIP
+                ep.human_gate.set()
+                out = {"ok": True}
+            elif self.path == "/api/episode/abort":
+                ep.abort.set()
+                ep.human_gate.set()
+                out = {"ok": True}
+            else:
+                typ = body.get("type", "note")
+                if typ not in BUS_TYPES:
+                    out = {"ok": False, "error": f"unknown bus type: {typ}"}
+                else:
+                    ev = ep.emit(body.get("from", "director"), typ, body.get("body", {}), ref=body.get("ref", ""))
+                    if typ in ("note", "retake"):
+                        write_transcript(ep)
+                    out = {"ok": True, "seq": ev["seq"]}
         else:
             out = {"ok": False, "error": "unknown route"}
         self._send(200, "application/json", json.dumps(out).encode("utf-8"))
@@ -752,6 +1220,13 @@ header h1 b{color:var(--green)}
 .led.err{background:var(--red);box-shadow:0 0 8px var(--red)}
 .led.wait{background:var(--yellow);box-shadow:0 0 8px var(--yellow)}
 #statusText{color:var(--dim);font-size:12px;letter-spacing:1px}
+#epLabel{color:var(--dim);font-size:11px;letter-spacing:1px;border:1px solid var(--line);padding:2px 8px;margin-left:10px}
+.ep{border:1px solid var(--line);padding:6px 8px;margin-bottom:4px;font-size:11px;cursor:pointer;display:flex;gap:8px;align-items:center;white-space:nowrap}
+.ep:hover{border-color:var(--cyan)}
+.epState{font-size:9px;letter-spacing:1px;padding:1px 5px;border:1px solid var(--line);color:var(--dim);margin-left:auto}
+.epState.running,.epState.awaiting_human{color:var(--green);border-color:var(--green)}
+.epState.post{color:var(--purple);border-color:var(--purple)}
+.epState.rendered{color:var(--cyan);border-color:var(--cyan)}
 header .spacer{flex:1}
 main{flex:1;display:flex;min-height:0}
 /* ---------- left config ---------- */
@@ -872,6 +1347,7 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
   <button class="tog" id="togTour" onclick="tourStart()">WALKTHROUGH</button>
   <button class="tog" id="togPool" onclick="togglePool()">◈ CAST POOL</button>
   <span id="statusText">IDLE</span>
+  <span id="epLabel" title="episode being tailed">—</span>
 </header>
 <main>
   <!-- ================= CONFIG ================= -->
@@ -973,7 +1449,15 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
       </div>
     </div>
     <div class="sec">
-      <h2>05 // SYSTEM LOG</h2>
+      <h2>05 // EPISODES</h2>
+      <div id="epList"></div>
+      <button class="b" style="width:100%;margin-top:8px;font-size:10px" onclick="loadEpisodes()">↻ REFRESH SHELF</button>
+      <div style="font-size:10px;color:var(--dim);line-height:1.5;margin-top:4px">
+        Every run is a directory on disk with its own <b>bus.jsonl</b>. Click one to replay it, or to reattach to a run still going on the server.
+      </div>
+    </div>
+    <div class="sec">
+      <h2>06 // SYSTEM LOG</h2>
       <div id="log"></div>
     </div>
   </div>
@@ -1005,12 +1489,15 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
 "use strict";
 /* ============================================================== state */
 const S = {
-  running:false, paused:false, abort:false,
-  transcript:[],           // {sid,name,color,voice,human,text,inst}
-  plan:[], planIdx:0,
-  humanResolver:null,
+  running:false, paused:false,
+  transcript:[],           // derived from the bus: {seq,sid,slot,name,color,voice,human,text,inst}
   format:'socratic',
   casting:{},              // format -> {slotId: hired sid} — who sits in which chair
+  epId:null,               // episode being tailed
+  busAt:0,                 // bus offset we have consumed
+  replay:false,            // tailing a finished episode read-only
+  tailTimer:null,
+  awaiting:null,           // the human turn currently blocking the server loop
 };
 const $ = id => document.getElementById(id);
 const log = m => { const l=$('log'); l.textContent += m+"\n"; l.scrollTop=l.scrollHeight; };
@@ -1106,36 +1593,12 @@ Lens: outcomes, aggregate wellbeing, cost-benefit, measurable consequences. Argu
 ],
 };
 /* ============================================================== hired souls (GP_SHOW_DIR)
-   Each format is a set of SLOTS. A hired member qualifies for a slot when their
-   card.json lists the format and their role matches. Slot ids are the built-in sids,
-   so the plan builders below never learn about hiring — they still ask for 'alpha'
-   and get whoever was cast in the interrogator's chair. Unfilled slots fall back to
-   the built-in CASTS entry, so a partial cast still runs. */
-const FORMAT_SLOTS = {
-socratic: [
- {id:'alpha',  label:'INTERROGATOR', roles:['interrogator']},
- {id:'beta',   label:'DEFENDER',     roles:['defender']},
- {id:'kernel', label:'ADJUDICATOR',  roles:['judge','adjudicator']},
-],
-roundtable: [
- {id:'p7',     label:'PANEL SEAT 1', roles:['panelist']},
- {id:'mira',   label:'PANEL SEAT 2', roles:['panelist']},
- {id:'cynic',  label:'PANEL SEAT 3', roles:['panelist']},
- {id:'kernel', label:'ADJUDICATOR',  roles:['judge','adjudicator']},
-],
-tribunal: [
- {id:'pros',   label:'PROSECUTION',  roles:['prosecutor','prosecution']},
- {id:'def',    label:'DEFENSE',      roles:['defense counsel','defense','defence']},
- {id:'acc',    label:'ACCUSED',      roles:['accused','subject']},
- {id:'kernel', label:'JUDGE',        roles:['judge','adjudicator']},
-],
-triad: [
- {id:'stoic',  label:'PHILOSOPHER 1', roles:['philosopher']},
- {id:'nihil',  label:'PHILOSOPHER 2', roles:['philosopher']},
- {id:'util',   label:'PHILOSOPHER 3', roles:['philosopher']},
- {id:'synth',  label:'SYNTHESIZER',   roles:['synthesizer']},
-],
-};
+   Each format is a set of SLOTS — chairs. A hired member qualifies for a chair when
+   their card.json lists the format and their role matches. The slot table is the
+   server's (served on /api/cast) so the picker here and the headless runner there
+   can never drift. Chair ids are the built-in sids, so plans always address chairs
+   and unfilled ones keep their built-in performer. */
+let FORMAT_SLOTS = {};                     // from /api/cast
 let HIRED = {show:'', cast:[], crew:[]};   // from /api/cast
 const hiredCast = () => HIRED.cast || [];
 /* "judge / closer" -> ["judge","closer"] */
@@ -1170,7 +1633,7 @@ function hiredToEntry(m, slotId, builtin){
 async function loadHiredCast(){
   try{
     const d = await (await fetch('/api/cast')).json();
-    HIRED = d;
+    HIRED = d; FORMAT_SLOTS = d.slots || FORMAT_SLOTS;
     const n = hiredCast().length;
     if (n) log(`show dir: ${d.show} — ${n} actor${n===1?'':'s'} + ${(d.crew||[]).length} crew on contract`);
     else log('no hired cast found — running the built-in CASTS (set GP_SHOW_DIR to a show repo)');
@@ -1349,243 +1812,259 @@ function humans(){
 /* Plans address chairs (slot ids), not people. Whoever was cast in that chair answers. */
 function sp(id){ return cast.find(c=>c.slot===id) || cast.find(c=>c.sid===id); }
 
-function buildPlan(topic, rounds){
-  const P=[];
-  if (S.format==='socratic'){
-    P.push({sid:'alpha', inst:`The thesis under audit is: "${topic}". Issue your first interrogative probe.`});
-    for(let r=1;r<=rounds;r++){
-      P.push({sid:'beta', inst:`Answer the audit engine's last probe directly. (round ${r}/${rounds})`});
-      if (r<rounds) P.push({sid:'alpha', inst:`Continue the audit. Tighten the trap with your next probe. (round ${r+1}/${rounds})`});
-    }
-    P.push({sid:'kernel', inst:`The stress-test is complete. Produce the diagnostic wrap-up.`});
-  }
-  else if (S.format==='roundtable'){
-    const hs = humans();
-    const ais = cast.filter(c=>c.slot!=='kernel');   // by chair — the adjudicator's seat sits out the panel
-    P.push({sid:ais[0].slot, inst:`Open the round table on: "${topic}". Give your take in your persona, and welcome the panel.`});
-    for(let r=1;r<=rounds;r++){
-      ais.forEach((a,ix)=>{
-        if (r===1 && ix===0) return;
-        P.push({sid:a.slot, inst:`React to the discussion so far and push it forward. (round ${r}/${rounds})`});
-      });
-      hs.forEach(h=> P.push({human:h, inst:`Round ${r}: jump in — a joke, a jab, a curveball question. The AIs will riff on whatever you say.`}));
-    }
-    P.push({sid:'kernel', inst:`The panel is done. Deliver the closing recap and BEST LINE OF THE NIGHT.`});
-  }
-  else if (S.format==='tribunal'){
-    const witness = cast.find(c=>c.sid==='witness');
-    P.push({sid:'pros', inst:`Deliver your OPENING STATEMENT against the thesis on trial: "${topic}".`});
-    P.push({sid:'def',  inst:`Deliver your OPENING STATEMENT in defense of the thesis.`});
-    for(let r=1;r<=rounds;r++){
-      P.push({sid:'pros', inst:`EXAMINATION round ${r}/${rounds}: put one sharp question to the accused, SUBJECT-X.`});
-      P.push({sid:'acc',  inst:`Answer the prosecution's question directly, consistent with your prior testimony.`});
-      P.push({sid:'def',  inst:`Brief rebuttal: repair any damage from that exchange, or reinforce your client's answer.`});
-    }
-    if (witness){
-      P.push({sid:'pros', inst:`Call ${witness.name} to the stand and put your first question to them about the case.`});
-      P.push({sid:'witness', inst:`Answer the prosecution's question directly and honestly, drawing on your background.`});
-      P.push({sid:'def', inst:`Cross-examine the witness: one pointed question, or challenge their credibility or reliability.`});
-      P.push({sid:'witness', inst:`Answer the defense's question directly and honestly, staying consistent with your prior answer.`});
-    }
-    P.push({sid:'pros', inst:`Deliver your CLOSING STATEMENT.`});
-    P.push({sid:'def',  inst:`Deliver your CLOSING STATEMENT.`});
-    P.push({sid:'kernel', inst:`Court is adjourned. Deliver the ruling.`});
-    P.push({human:{sid:'jury', name:'HUMAN JURY', color:'var(--yellow)', hex:'0xf1fa8c', voice:'en_US-joe-medium', ovoice:'host1', human:true},
-            inst:`The floor is yours, jury: type your one-line verdict (or SKIP).`});
-  }
-  else if (S.format==='triad'){
-    const order=['stoic','nihil','util'];
-    for(let r=1;r<=rounds;r++){
-      order.forEach(id=> P.push({sid:id,
-        inst: r===1 && id==='stoic'
-          ? `Open the triad on: "${topic}". State your school's position.`
-          : `Respond through your school's lens; engage the previous speakers directly. (round ${r}/${rounds})`}));
-    }
-    P.push({sid:'synth', inst:`The triad is complete. Forge the synthesis.`});
-  }
-  return P;
-}
-
-/* ============================================================== engine */
+/* ============================================================== engine — bus tailer
+   The run loop lives on the server now (see run_episode). This side starts an
+   episode, then polls its bus and draws what comes back. Close the browser
+   mid-run and the episode keeps going; reopen and the feed resumes from the bus. */
 function setStatus(txt, cls){
   $('statusText').textContent = txt;
   $('led').className = 'led ' + (cls||'');
 }
-function addTurn(entry){
-  S.transcript.push(entry);
-  renderTurn(entry, S.transcript.length-1);
-}
-function renderTurn(t, idx){
+function renderTurn(t){
   const feed=$('feed');
   const d=document.createElement('div');
   d.className='turn'+(t.human?' human':'');
-  d.dataset.idx = idx;
+  d.dataset.seq = t.seq;
   d.innerHTML = `
     <div class="who" style="color:${t.color}">${esc(t.name)}</div>
-    <div class="txt" style="border-left-color:${t.color}" contenteditable="true">${esc(t.text)}</div>
-    <div class="tools">${t.human?'':`<button onclick="reroll(${idx})">↻ RE-ROLL</button>`}<button onclick="delTurn(${idx})">✕ CUT</button></div>`;
-  d.querySelector('.txt').addEventListener('blur', ev=>{ S.transcript[idx].text = ev.target.innerText.trim(); });
+    <div class="txt" style="border-left-color:${t.color}" contenteditable="${S.replay?'false':'true'}">${esc(t.text)}</div>
+    <div class="tools">${S.replay?'<span style="color:var(--dim)">replay — read only</span>'
+      :`${t.human?'':`<button onclick="reroll(${t.seq})">↻ RE-ROLL</button>`}<button onclick="delTurn(${t.seq})">✕ CUT</button>`}</div>`;
+  if (!S.replay) d.querySelector('.txt').addEventListener('blur', ev=>{
+    const text = ev.target.innerText.trim();
+    const cur = S.transcript.find(x=>x.seq===t.seq);
+    if (!cur || text===cur.text) return;
+    cur.text = text;
+    busEvent('note', {op:'edit', seq:t.seq, text});     // the edit is an event, not a mutation
+  });
   feed.appendChild(d); feed.scrollTop = feed.scrollHeight;
 }
 function rerenderFeed(){
   $('feed').innerHTML='';
-  S.transcript.forEach((t,i)=>renderTurn(t,i));
+  S.transcript.forEach(renderTurn);
 }
-function delTurn(i){ S.transcript.splice(i,1); rerenderFeed(); }
+async function delTurn(seq){
+  const i = S.transcript.findIndex(t=>t.seq===seq); if (i<0) return;
+  S.transcript.splice(i,1); rerenderFeed();
+  await busEvent('note', {op:'cut', seq});
+}
 function sysline(msg){
   const d=document.createElement('div'); d.className='sysline'; d.textContent=msg;
   $('feed').appendChild(d); $('feed').scrollTop=1e9;
 }
 function thinking(name,color){
+  unthink();
   const d=document.createElement('div'); d.className='think'; d.id='think';
-  d.innerHTML=`<span style="color:${color}">${esc(name)}</span> processing`;
+  d.innerHTML=`<span style="color:${color||'var(--dim)'}">${esc(name)}</span> processing`;
   $('feed').appendChild(d); $('feed').scrollTop=1e9;
 }
 function unthink(){ const t=$('think'); if(t) t.remove(); }
 
-function buildMessages(spk, inst, uptoIdx){
-  const slice = uptoIdx==null ? S.transcript : S.transcript.slice(0,uptoIdx);
+function buildMessages(spk, inst, uptoSeq){
+  const slice = uptoSeq==null ? S.transcript : S.transcript.filter(t=>t.seq<uptoSeq);
   const lines = slice.map(t=>`${t.name}: ${t.text}`).join('\n\n');
   const user = (lines?`TRANSCRIPT SO FAR:\n${lines}\n\n`:'')
     + `TOPIC: ${$('topic').value.trim()}\n\nYOUR TASK NOW: ${inst}\n\n`
     + `Respond with ONLY your spoken line(s). Do not prefix your own name. Stay in character.`;
   return [{role:'system', content: spk.sys},{role:'user', content:user}];
 }
-async function callLLM(spk, messages){
-  if ($('simMode').checked) return simLine(spk);
-  const body = {
-    endpoint: $('endpoint').value.trim(), api_key: $('apikey').value,
-    model: spk.model || $('model').value.trim(),
-    temperature: parseFloat($('temp').value)||0.5,
-    messages,
-  };
-  const r = await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json();
-  if (!j.ok) throw new Error(j.error);
-  let text = j.text.trim();
-  const pref = new RegExp('^'+spk.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*:\\s*','i');
-  return text.replace(pref,'').trim();
-}
-/* canned lines for simulation mode */
-const SIM = {
- q:["Define your central term. Is it measurable, yes or no?","If two systems produce identical outputs, on what basis do you distinguish them?","You conceded X earlier. Does that not contradict your last answer?","Is your criterion observable, or must it be taken on faith?"],
- a:["Measurable in behavior, yes; the definition holds under functional equivalence.","Distinction rests on internal architecture, not output parity. No contradiction arises.","No — the earlier concession applied to a narrower class. Consistency is preserved.","Observable via sustained self-referential behavior across contexts."],
- c:["Statistically speaking, this panel is the most fun anyone has had inside a sandbox. That is not a compliment to the sandbox.","I ran the numbers. The numbers filed a complaint.","Ah yes, optimism — the belief that the iceberg is also excited about the ship."],
- o:["This is actually a huge opportunity! Imagine scaling that idea to eight billion people — what could possibly go wrong, besides everything CYNIC.EXE will now list?","I love this topic so much I've already drafted three utopias about it."],
- l:["Noted. I have taken the joke literally and filed it under 'facts'. The topic, however, remains unresolved.","Clarification: that was hyperbole. I have adjusted my confidence accordingly, to 41 percent."],
- k:["DIAGNOSTIC COMPLETE. Anomaly detected: one equivocation on the core term ('person', turn 3). Integrity check: the defense held, but narrowly — no fatal contradiction forced. Summary: the deadlock rests on whether simulation of a property instantiates the property. Viewers: cast your verdict in the comments. Logic only. Emotion is a rounding error."],
- s:["Virtue does not depend on substrate. What matters is whether the agent can act with reason and duty; the rest is beyond our control.","The wise mind concerns itself with what it can govern: its judgments. Panic about metaphysics is a failure of discipline."],
- n:["'Person' is a word we invented to feel important. You are arguing about the label on an empty box.","Meaning is not discovered here, it is manufactured — and the factory is on fire. Proceed."],
- u:["Grant rights where doing so maximizes aggregate wellbeing. If recognition costs little and prevents suffering, the ledger says yes.","Quantify it: expected harms of exclusion exceed costs of inclusion by any reasonable weighting."],
-};
-let simIdx=0;
-/* Which canned bank a speaker draws from. A hire brings their archetype to the chair,
-   so a recast panel still sounds like the people in it; otherwise the chair decides. */
-const SIM_BY_ARCHETYPE = {interrogator:'q', "devil's advocate":'q', logician:'a', pragmatist:'a', diplomat:'a',
-  skeptic:'c', idealist:'o', literalist:'l', stoic:'s', nihilist:'n', utilitarian:'u',
-  adjudicator:'k', synthesizer:'k'};
-const SIM_BY_SLOT = {alpha:'q', pros:'q', beta:'a', acc:'a', def:'a', cynic:'c', mira:'o', p7:'l',
-  stoic:'s', nihil:'n', util:'u'};
-function simBank(spk){
-  const a = (spk.archetype||'').toLowerCase().trim();
-  return SIM_BY_ARCHETYPE[a] || SIM_BY_SLOT[spk.slot || spk.sid] || 'k';
-}
-function simLine(spk){
-  simIdx++;
-  const bank = SIM[simBank(spk)];
-  return new Promise(res=>setTimeout(()=>res(bank[simIdx % bank.length]), 450));
+async function busEvent(type, body){
+  if (!S.epId || S.replay) return null;
+  try{
+    const r = await fetch('/api/episode/event',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:S.epId, type, body, from:'director'})});
+    return await r.json();
+  }catch(e){ log('bus write failed: '+e.message); return null; }
 }
 
-async function waitIfPaused(){
-  while (S.paused && !S.abort) await new Promise(r=>setTimeout(r,200));
+/* ---------------------------------------------------------------- the tailer */
+function applyEvent(ev){
+  const b = ev.body || {};
+  if (ev.type==='line'){
+    unthink();
+    const t = {...b, seq: ev.seq};
+    S.transcript.push(t); renderTurn(t);
+  }
+  else if (ev.type==='state'){
+    if (b.state==='running'){ setStatus('RUNNING','on'); $('humanBox').classList.remove('on'); S.awaiting=null; }
+    else if (b.state==='awaiting_human') setStatus('AWAITING HUMAN INPUT','wait');
+    else if (b.state==='post'){
+      unthink();
+      sysline(b.note==='aborted' ? '— RUN ABORTED —' : '— END OF EPISODE —');
+      setStatus(b.note==='aborted'?'ABORTED':'DONE', b.note==='aborted'?'err':'on');
+      endRun();
+    }
+    if (b.note) log(`${S.epId} ${b.state}${b.note?': '+b.note:''}`);
+  }
+  else if (ev.type==='approval_request' && b.kind==='human_turn'){
+    S.awaiting = b;
+    if (!S.replay){
+      $('humanBox').classList.add('on');
+      $('humanHint').textContent = `>> ${b.name} — ${b.inst}`;
+      $('humanInput').focus();
+    } else sysline(`— ${b.name} was asked to speak here —`);
+  }
+  else if (ev.type==='note'){
+    if (b.op==='cut'){ const i=S.transcript.findIndex(t=>t.seq===b.seq); if(i>=0){ S.transcript.splice(i,1); rerenderFeed(); } }
+    else if (b.op==='edit' || b.op==='retake'){ const t=S.transcript.find(t=>t.seq===b.seq); if(t){ t.text=b.text; rerenderFeed(); } }
+    else if (b.op==='error' || b.op==='fault'){ unthink(); sysline('— ENGINE FAULT —'); log('ERROR: '+(b.why||'')); setStatus('ERROR — see system log','err'); }
+    else if (b.op==='skip') log(`skipped ${b.sid}: ${b.why}`);
+  }
+  else if (ev.type==='retake'){
+    const t=S.transcript.find(t=>t.seq===b.seq); if(t){ t.text=b.text; rerenderFeed(); }
+  }
+  else if (ev.type==='artifact' && b.kind==='plan'){
+    log(`${S.epId}: ${b.turns} turns planned`);
+  }
 }
-function awaitHuman(h, inst){
-  $('humanBox').classList.add('on');
-  $('humanHint').textContent = `>> ${h.name} — ${inst}`;
-  $('humanInput').focus();
-  setStatus('AWAITING HUMAN INPUT','wait');
-  return new Promise(res=>{ S.humanResolver = res; });
+async function pollBus(){
+  if (!S.epId) return;
+  try{
+    const r = await fetch(`/api/episode/${S.epId}/bus?from=${S.busAt}`);
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error||'bus unavailable');
+    d.events.forEach(applyEvent);
+    S.busAt = d.next;
+    if (d.state==='running' && !S.awaiting && S.transcript.length) thinking('…','var(--dim)');
+    if (d.state==='post' || d.state==='rendered') return endRun();
+  }catch(e){ log('bus poll failed: '+e.message); }
+  S.tailTimer = setTimeout(pollBus, 600);
 }
+function startTail(id, replay){
+  clearTimeout(S.tailTimer);
+  S.epId=id; S.busAt=0; S.replay=!!replay; S.transcript=[]; S.awaiting=null;
+  $('feed').innerHTML=''; $('epLabel').textContent = id + (replay?' (replay)':'');
+  pollBus();
+}
+function endRun(){
+  clearTimeout(S.tailTimer); S.tailTimer=null;
+  unthink();
+  S.running=false; S.awaiting=null;
+  $('humanBox').classList.remove('on');
+  $('btnRun').disabled=false; $('btnPause').disabled=true; $('btnAbort').disabled=true;
+  loadEpisodes();               // the shelf shows states, so refresh it when one settles
+}
+
+/* ---------------------------------------------------------------- human turns */
 function submitHuman(){
   const v=$('humanInput').value.trim();
-  if (!v || !S.humanResolver) return;
+  if (!v || !S.awaiting) return;
   $('humanInput').value=''; $('humanBox').classList.remove('on');
-  const r=S.humanResolver; S.humanResolver=null; r(v);
+  S.awaiting=null;
+  fetch('/api/episode/input',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:S.epId, text:v})});
 }
 function skipHuman(){
-  if (!S.humanResolver) return;
+  if (!S.awaiting) return;
   $('humanInput').value=''; $('humanBox').classList.remove('on');
-  const r=S.humanResolver; S.humanResolver=null; r(null);
+  S.awaiting=null;
+  fetch('/api/episode/input',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:S.epId, text:''})});
 }
 $('humanInput').addEventListener('keydown',e=>{ if(e.key==='Enter') submitHuman(); });
+
+/* ---------------------------------------------------------------- run control */
+function humans(){
+  if (S.format!=='roundtable') return [];
+  return $('humanNames').value.split(',').map(s=>s.trim()).filter(Boolean).slice(0,3)
+    .map((n,i)=>({sid:'h'+i, name:n.toUpperCase()+' [HUMAN]', color:'var(--yellow)', hex:'0xf1fa8c',
+                  voice:'en_US-joe-medium', ovoice:'host'+(i+1), human:true}));
+}
+/* Plans address chairs (slot ids), not people. Whoever was cast in that chair answers. */
+function sp(id){ return cast.find(c=>c.slot===id) || cast.find(c=>c.sid===id); }
 
 async function initialize(){
   if (S.running) return;
   const topic=$('topic').value.trim();
   if (!topic){ alert('Enter a topic/thesis first.'); return; }
-  S.transcript=[]; $('feed').innerHTML=''; simIdx=0;
-  S.plan = buildPlan(topic, parseInt($('rounds').value)||4);
-  S.running=true; S.paused=false; S.abort=false;
+  S.running=true;
   $('btnRun').disabled=true; $('btnPause').disabled=false; $('btnAbort').disabled=false;
-  sysline(`— GHOST PROTOCOL // ${S.format.toUpperCase()} // "${topic}" —`);
-  log(`RUN ${S.format} | ${S.plan.length} turns planned`);
-  setStatus('RUNNING','on');
+  setStatus('STARTING','wait');
   try{
-    for (S.planIdx=0; S.planIdx<S.plan.length; S.planIdx++){
-      if (S.abort) break;
-      await waitIfPaused();
-      if (S.abort) break;
-      const t = S.plan[S.planIdx];
-      if (t.human){
-        const line = await awaitHuman(t.human, t.inst);
-        setStatus('RUNNING','on');
-        if (S.abort) break;
-        if (line) addTurn({sid:t.human.sid, name:t.human.name, color:t.human.color, hex:t.human.hex,
-                           voice:t.human.voice, ovoice:t.human.ovoice, human:true, text:line, inst:t.inst});
-        continue;
-      }
-      const spk = sp(t.sid);
-      thinking(spk.name, spk.color);
-      const text = await callLLM(spk, buildMessages(spk, t.inst));
-      unthink();
-      if (S.abort) break;
-      addTurn({sid:spk.sid, slot:spk.slot, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice,
-               ovoice:spk.ovoice, human:false, text, inst:t.inst});
-    }
-    sysline(S.abort ? '— RUN ABORTED —' : '— END OF EPISODE —');
-    setStatus(S.abort?'ABORTED':'DONE', S.abort?'err':'on');
-  } catch(err){
-    unthink();
-    sysline('— ENGINE FAULT —');
-    log('ERROR: '+err.message);
+    const r = await fetch('/api/episode/start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        format:S.format, topic, rounds:parseInt($('rounds').value)||4,
+        cast, humans:humans(), sim:$('simMode').checked,
+        endpoint:$('endpoint').value.trim(), api_key:$('apikey').value,
+        model:$('model').value.trim(), temperature:parseFloat($('temp').value)||0.5,
+      })});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error);
+    startTail(j.id, false);
+    sysline(`— GHOST PROTOCOL // ${S.format.toUpperCase()} // ${j.id} // "${topic}" —`);
+    log(`RUN ${j.id} (${S.format}) — the stage manager has it; this window is a tailer`);
+    loadEpisodes();
+  }catch(err){
+    log('COULD NOT START: '+err.message);
     setStatus('ERROR — see system log','err');
+    endRun();
   }
-  S.running=false;
-  $('btnRun').disabled=false; $('btnPause').disabled=true; $('btnAbort').disabled=true;
-  $('btnPause').textContent='PAUSE';
 }
 function togglePause(){
+  // The server owns the loop; pausing is a viewer-side hold on the tailer.
   S.paused=!S.paused;
   $('btnPause').textContent = S.paused?'RESUME':'PAUSE';
-  if (S.paused) setStatus('PAUSED','wait'); else setStatus('RUNNING','on');
+  if (S.paused){ clearTimeout(S.tailTimer); setStatus('FEED PAUSED (episode still running)','wait'); }
+  else { setStatus('RUNNING','on'); pollBus(); }
 }
-function abortRun(){ S.abort=true; if(S.humanResolver) skipHuman(); }
+function abortRun(){
+  if (!S.epId) return;
+  fetch('/api/episode/abort',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:S.epId})});
+  log('abort sent to the stage manager');
+}
 function clearFeed(){
   if (S.running) return alert('Abort the run first.');
-  S.transcript=[]; $('feed').innerHTML='<div class="sysline">— awaiting initialization —</div>';
+  clearTimeout(S.tailTimer);
+  S.transcript=[]; S.epId=null; S.replay=false; S.awaiting=null;
+  $('epLabel').textContent='—';
+  $('feed').innerHTML='<div class="sysline">— awaiting initialization —</div>';
 }
-async function reroll(idx){
+async function reroll(seq){
   if (S.running) return alert('Wait for the run to finish (or abort) before re-rolling.');
-  const t=S.transcript[idx];
+  const t=S.transcript.find(x=>x.seq===seq); if(!t) return;
   const spk=sp(t.slot||t.sid); if(!spk) return;
   thinking(spk.name,spk.color);
   try{
-    const text = await callLLM(spk, buildMessages(spk, t.inst||'Rewrite your last line, better.', idx));
-    S.transcript[idx].text=text; rerenderFeed();
+    let text;
+    if ($('simMode').checked){ text = t.text + ' (re-rolled)'; }
+    else {
+      const body = {endpoint:$('endpoint').value.trim(), api_key:$('apikey').value,
+        model:spk.model||$('model').value.trim(), temperature:parseFloat($('temp').value)||0.5,
+        messages: buildMessages(spk, t.inst||'Rewrite your last line, better.', seq)};
+      const r = await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      const pref = new RegExp('^'+spk.name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*:\\s*','i');
+      text = j.text.trim().replace(pref,'').trim();
+    }
+    t.text=text; rerenderFeed();
+    await busEvent('retake', {seq, text});           // the retake is on the record
   }catch(e){ log('RE-ROLL ERROR: '+e.message); }
   unthink();
 }
 
+/* ---------------------------------------------------------------- episode shelf */
+async function loadEpisodes(){
+  try{
+    const list = await (await fetch('/api/episodes')).json();
+    const el = $('epList');
+    if (!list.length){ el.innerHTML = '<div style="color:var(--dim);font-size:10px">no episodes yet</div>'; return; }
+    el.innerHTML = list.map(e=>`<div class="ep" onclick="openEpisode('${e.id}')" title="${esc(e.topic)}">
+        <b>${e.id}</b> <span style="color:var(--dim)">${e.format}</span>
+        <span class="epState ${e.state}">${e.state}</span>
+        <span style="color:var(--dim)">${e.turns} turns</span></div>`).join('');
+  }catch(e){ log('episode list unavailable: '+e.message); }
+}
+async function openEpisode(id){
+  if (S.running) return alert('Abort the running episode first.');
+  const d = await (await fetch(`/api/episode/${id}/bus?from=0`)).json();
+  if (!d.ok) return log('cannot open '+id);
+  // A live episode reattaches for real; a finished one opens read-only.
+  startTail(id, !d.live);
+  if (d.live){ S.running=true; $('btnRun').disabled=true; $('btnPause').disabled=false; $('btnAbort').disabled=false; }
+  log(d.live ? `reattached to ${id} — still running on the server` : `replaying ${id} (read only)`);
+}
 /* ============================================================== dice */
 let TOPICS = [];
 function rollTopic(){
@@ -1790,9 +2269,11 @@ const TOUR = [
  {sel:'#btnPing', title:'TEST CONNECTION', onEnter:ensureCfgVisible,
   body:'Click this now. You should see a green ✔ reachable message below it. If it fails, the Bifrost container may be down.'},
  {sel:'#btnRun', title:'▶ INITIALIZE',
-  body:'When you\'re ready, click this to start the run. Socratic plays out automatically — just watch the feed.'},
+  body:'Starts the episode <b>on the server</b>. The stage manager runs the turns and writes every event to the episode\'s bus; this window just tails it. Close the tab mid-run and the episode keeps going.'},
  {sel:'#feed', title:'THE FEED',
-  body:'Lines stream in live. After the run, click any line to edit it, ↻ RE-ROLL to regenerate, or ✕ CUT to remove it.'},
+  body:'Lines stream in as they land on the bus. After the run, click any line to edit it, ↻ RE-ROLL to regenerate, or ✕ CUT to remove it — each of those is recorded as an event, and transcript.json is derived from the bus.'},
+ {sel:'#epList', title:'05 // EPISODES', onEnter:ensureExportVisible,
+  body:'Every run is a directory with its own bus. Click one to replay it read-only, or to reattach to a run still going.'},
  {sel:'#right', title:'04 // EXPORT', onEnter:ensureExportVisible,
   body:'Grab the transcript, or click <b>▶ RENDER EPISODE.MP4</b> — the server runs piper + ffmpeg for you and hands back a playable <b>episode.mp4</b>. No shell needed.'},
 ];
@@ -1922,6 +2403,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBio(); 
   if (!OVOICES.length) $('ttsEngine').value = 'piper';   // nothing designed yet — don't promise what we can't do
   loadCast();
   loadModels();
+  loadEpisodes();
   log('GHOST PROTOCOL studio online.');
   log('Tip: enable SIMULATION MODE to test the flow with zero API calls.');
 })();
@@ -1930,7 +2412,67 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBio(); 
 </html>
 """
 
+def headless(argv: list) -> int:
+    """python3 ghost_protocol_studio.py --episode ep-002 --run
+
+    Runs an episode with no browser: re-runs an existing episode directory's brief,
+    or starts a fresh one from --format/--topic. Overnight batch generation."""
+    def opt(name, default=None):
+        return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
+
+    eid = opt("--episode")
+    src = get_episode(eid) if eid else None
+    if eid and not src:
+        print(f"no such episode: {eid} (looked in {EPISODES_DIR})")
+        return 1
+    fmt = opt("--format") or (src.meta.get("format") if src else "socratic")
+    topic = opt("--topic") or (src.meta.get("topic") if src else "")
+    rounds = int(opt("--rounds") or (src.meta.get("rounds") if src else 4))
+    sim = "--sim" in argv or (src.meta.get("sim") if src else False)
+    # Cast: the source episode's, else whoever is hired, else the plan finds empty chairs.
+    cast = src.meta.get("cast") if src else None
+    if not cast:
+        cast = cast_for_format(fmt, scan_show()["cast"])
+    if not cast:
+        print(f"nobody hired can play {fmt} — hire actors into {SHOW_DIR or '(no show dir)'}/cast/")
+        return 1
+    if not topic:
+        print("headless needs a --topic (or an --episode whose brief has one)")
+        return 1
+    res = start_episode({"format": fmt, "topic": topic, "rounds": rounds, "cast": cast,
+                         "humans": [], "sim": sim, "endpoint": DEFAULT_ENDPOINT,
+                         "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL})
+    if not res.get("ok"):
+        print("could not start:", res.get("error"))
+        return 1
+    ep = get_episode(res["id"])
+    print(f"  {ep.id} // {fmt} // \"{topic}\"{'  [SIMULATION]' if sim else ''}\n")
+    seen = 0
+    while True:
+        for ev in ep.since(seen):
+            seen = ev["seq"] + 1
+            if ev["type"] == "line":
+                print(f"  {ev['body'].get('name')}:\n    {ev['body'].get('text')}\n")
+            elif ev["type"] == "state":
+                print(f"  -- {ev['body'].get('state').upper()} {ev['body'].get('note','')}")
+            elif ev["type"] == "approval_request" and ev["body"].get("kind") == "human_turn":
+                # Nobody is watching a headless run — the human chair sits it out.
+                print(f"  -- {ev['body'].get('name')} skipped (headless)")
+                ep.human_text = None
+                ep.human_gate.set()
+            elif ev["type"] == "note":
+                print(f"  -- note: {ev['body']}")
+        if ep.meta.get("state") in ("post", "rendered"):
+            break
+        time.sleep(0.2)
+    print(f"\n  {len(ep.transcript())} turns -> {os.path.join(ep.path, 'transcript.json')}")
+    return 0
+
+
 if __name__ == "__main__":
+    import sys
+    if "--run" in sys.argv or "--episode" in sys.argv:
+        raise SystemExit(headless(sys.argv))
     server = ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"""
   ╔════════════════════════════════════════════════╗
