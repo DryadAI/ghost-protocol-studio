@@ -48,6 +48,13 @@ except Exception:  # noqa: BLE001 — file optional; ship a tiny fallback bank
         {"t": "Birds would owe humanity rent if they understood property law.", "cat": "absurd"},
     ]
 
+CHARACTERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "characters.json")
+try:
+    with open(CHARACTERS_FILE, encoding="utf-8") as _f:
+        CHARACTERS = json.load(_f).get("characters", [])
+except Exception:  # noqa: BLE001 — file optional; app works with plain CASTS if missing
+    CHARACTERS = []
+
 
 def proxy_chat(body: dict) -> dict:
     """Forward one chat completion to the configured OpenAI-compatible endpoint."""
@@ -177,7 +184,7 @@ def render_episode(payload: dict) -> dict:
         if not os.path.isfile(voice_path):
             return {"ok": False, "error": f"voice model not found: {voice}.onnx (segment {idx}, {name})"}
 
-        portrait_path = os.path.join(PORTRAITS_DIR, f"{seg.get('sid', '')}.jpg")
+        portrait_path = os.path.join(PORTRAITS_DIR, f"{seg.get('sid', '')}.png")
         has_portrait = bool(seg.get("sid")) and os.path.isfile(portrait_path)
 
         txt_path = os.path.join(BUILD_DIR, f"{i}.txt")
@@ -215,7 +222,8 @@ def render_episode(payload: dict) -> dict:
             fc = (
                 f"[0:v]scale=1536:1536,zoompan=z='min(zoom+0.0008,1.15)':"
                 f"x='iw/2-(iw/zoom/2)+40*sin(on/12)':y='ih/2-(ih/zoom/2)+25*sin(on/9+1)':"
-                f"d={nframes}:s={PORTRAIT_SIZE}x{PORTRAIT_SIZE}:fps={FPS}[portrait];"
+                f"d={nframes}:s={PORTRAIT_SIZE}x{PORTRAIT_SIZE}:fps={FPS},"
+                f"format=rgba,rotate='0.035*sin(t*1.3)':c=black@0:ow=iw:oh=ih[portrait];"
                 f"{prep_chain}"
                 f"{bg_ref}[portrait]overlay=120:100[bg1];"
                 f"[bg1]drawtext=text='[ {name} ]':x=120:y={PORTRAIT_SIZE + 140}:fontsize=42:fontcolor={color}:font=Monospace:{TEXT_BOX},"
@@ -291,6 +299,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", HTML.encode("utf-8"))
         elif self.path == "/api/topics":
             self._send(200, "application/json", json.dumps(TOPICS).encode("utf-8"))
+        elif self.path == "/api/characters":
+            self._send(200, "application/json", json.dumps(CHARACTERS).encode("utf-8"))
+        elif self.path.startswith("/assets/"):
+            rel = self.path[len("/assets/"):]
+            fpath = os.path.abspath(os.path.join(BASE_DIR, "assets", rel))
+            if fpath.startswith(os.path.join(BASE_DIR, "assets") + os.sep) and os.path.isfile(fpath):
+                ctype = "image/png" if fpath.endswith(".png") else "image/jpeg"
+                with open(fpath, "rb") as f:
+                    self._send(200, ctype, f.read())
+            else:
+                self._send(404, "text/plain", b"not found")
         elif self.path == "/api/defaults":
             self._send(200, "application/json", json.dumps({
                 "endpoint": DEFAULT_ENDPOINT, "api_key": DEFAULT_KEY, "model": DEFAULT_MODEL,
@@ -665,19 +684,34 @@ async function loadModels(){
   }catch(e){ log('model list fetch error: '+e.message); }
 }
 
+let CHAR_META = {};  // sid -> {image, archetype, humor_style, aiModel} from /api/characters
+async function loadCharacterMeta(){
+  try{
+    const list = await (await fetch('/api/characters')).json();
+    CHAR_META = {};
+    list.forEach(c => CHAR_META[c.sid] = c);
+    log(`character registry loaded: ${list.length} profiles`);
+  }catch(e){ log('character registry unavailable: '+e.message); }
+}
 function loadCast(){
-  cast = CASTS[S.format].map(c => ({...c, model:''}));
+  cast = CASTS[S.format].map(c => {
+    const meta = CHAR_META[c.sid] || {};
+    return {...c, model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
+  });
   renderCastList();
 }
 function renderCastList(){
   const el = $('castList'); el.innerHTML='';
   cast.forEach((c,i)=>{
     const d=document.createElement('div'); d.className='cast';
+    const thumb = c.image ? `<img src="/${c.image}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;object-position:top;border:1px solid ${c.color}">` : `<span class="dot" style="background:${c.color}"></span>`;
+    const archBadge = c.archetype ? `<div style="font-size:10px;color:${c.color};letter-spacing:1px;margin:-4px 0 8px">${esc(c.archetype).toUpperCase()}${c.humor?' · '+esc(c.humor):''}</div>` : '';
     d.innerHTML = `
       <div class="head" onclick="this.parentNode.classList.toggle('open')">
-        <span class="dot" style="background:${c.color}"></span><b style="color:${c.color}">${esc(c.name)}</b><span class="car">▾</span>
+        ${thumb}<b style="color:${c.color}">${esc(c.name)}</b><span class="car">▾</span>
       </div>
       <div class="body">
+        ${archBadge}
         <label>NAME</label><input type="text" value="${esc(c.name)}" onchange="cast[${i}].name=this.value">
         <label>MODEL OVERRIDE (blank = default)</label><select class="castModelSel" data-idx="${i}" onchange="cast[${i}].model=this.value">${modelOptionsHtml(MODEL_LIST, c.model, true)}</select>
         <label>VOICE (piper)</label>
@@ -1006,9 +1040,11 @@ function dl(name, text, mime){
 function dlTranscript(kind){
   if (!S.transcript.length) return alert('No transcript yet.');
   if (kind==='json'){
+    const castInfo = sid => { const c = sp(sid); return c ? {model:c.model||'(default)', archetype:c.archetype||'', humor_style:c.humor||'', voice:c.voice} : {}; };
     dl('transcript.json', JSON.stringify({show:'THE GHOST PROTOCOL',format:S.format,
       topic:$('topic').value.trim(), date:new Date().toISOString(),
-      transcript:S.transcript.map(t=>({speaker:t.name,human:!!t.human,voice:t.voice,text:t.text}))},null,2),
+      cast: cast.map(c=>({sid:c.sid, name:c.name, archetype:c.archetype||'', humor_style:c.humor||'', model:c.model||'(default)', voice:c.voice, image:c.image||''})),
+      transcript:S.transcript.map(t=>({speaker:t.name, sid:t.sid, human:!!t.human, voice:t.voice, text:t.text, ...castInfo(t.sid)}))},null,2),
       'application/json');
   } else {
     dl('transcript.txt', S.transcript.map(t=>`${t.name}:\n${t.text}\n`).join('\n'));
@@ -1034,29 +1070,61 @@ function dlCompileScript(){
 # THE GHOST PROTOCOL — episode compiler (100% open source: piper + ffmpeg)
 # Generated ${new Date().toISOString()} | format: ${S.format}
 #
+# Mirrors the server-side RENDER EPISODE.MP4 pipeline: cutout portraits
+# (assets/portraits/<sid>.png, transparent) get a Ken Burns zoom + wobbling
+# pan + rotation over the format's backdrop (assets/backdrops/${S.format}.jpg);
+# lines without a portrait use the plain full-width layout.
+#
 # Requirements (Arch):
 #   sudo pacman -S ffmpeg
 #   yay -S piper-tts-bin          # or: pip install piper-tts
 #   Download the voice models used below (*.onnx + *.onnx.json) from
 #   https://huggingface.co/rhasspy/piper-voices and put them in ./voices/
+#   Run this from the repo root so ./assets/ resolves, or set ASSETSDIR.
 #
 # Run:   bash compile_show.sh     ->  episode.mp4
 # ==========================================================================
 set -euo pipefail
 command -v piper  >/dev/null || { echo "piper not found";  exit 1; }
 command -v ffmpeg >/dev/null || { echo "ffmpeg not found"; exit 1; }
-W=1920; H=1080; BG=0x0a0e14
+W=1920; H=1080; BG=0x0a0e14; PSIZE=640; FPS=25
+TEXTBOX="box=1:boxcolor=0x0a0e14@0.55:boxborderw=10"
 VOICEDIR="\${VOICEDIR:-voices}"
+ASSETSDIR="\${ASSETSDIR:-assets}"
+FORMAT="${S.format}"
+BACKDROP="$ASSETSDIR/backdrops/$FORMAT.jpg"
 mkdir -p build; rm -f build/concat.txt
 
-seg () { # seg <idx> <NAME> <colorhex> <voice> ; reads text from build/<idx>.txt
-  local i=$1 name=$2 color=$3 voice=$4 tf="build/$1.txt"
+seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> ; reads text from build/<idx>.txt
+  local i=$1 name=$2 color=$3 voice=$4 sid=$5 tf="build/$1.txt"
   echo ">> [$i] $name"
   piper --model "$VOICEDIR/$voice.onnx" --output_file "build/$i.wav" < "$tf"
   local dur; dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "build/$i.wav")
-  ffmpeg -y -v error -f lavfi -i "color=c=$BG:s=\${W}x\${H}:d=$dur" -i "build/$i.wav" \\
-    -vf "drawtext=text='[ $name ]':x=120:y=140:fontsize=46:fontcolor=$color:font=Monospace,drawtext=textfile='$tf':x=120:y=260:fontsize=34:fontcolor=0xf8f8f2:font=Monospace:line_spacing=16" \\
-    -c:v libx264 -preset fast -pix_fmt yuv420p -c:a aac -shortest "build/$i.mp4"
+
+  local bgargs=(-f lavfi -i "color=c=$BG:s=\${W}x\${H}:d=$dur")
+  local bgprep=""
+  if [ -f "$BACKDROP" ]; then
+    bgargs=(-loop 1 -t "$dur" -i "$BACKDROP")
+    bgprep="scale=\${W}:\${H}:force_original_aspect_ratio=increase,crop=\${W}:\${H}"
+  fi
+
+  local portrait="$ASSETSDIR/portraits/$sid.png"
+  if [ -n "$sid" ] && [ -f "$portrait" ]; then
+    local textx=$((120 + PSIZE + 40))
+    local bgref="[1:v]" prepchain=""
+    if [ -n "$bgprep" ]; then prepchain="[1:v]\${bgprep}[bgprep];"; bgref="[bgprep]"; fi
+    local nframes; nframes=$(awk -v d="$dur" -v fps="$FPS" 'BEGIN{printf "%d", (d*fps)+0.5}')
+    local fc="[0:v]scale=1536:1536,zoompan=z='min(zoom+0.0008,1.15)':x='iw/2-(iw/zoom/2)+40*sin(on/12)':y='ih/2-(ih/zoom/2)+25*sin(on/9+1)':d=\${nframes}:s=\${PSIZE}x\${PSIZE}:fps=\${FPS},format=rgba,rotate='0.035*sin(t*1.3)':c=black@0:ow=iw:oh=ih[portrait];\${prepchain}\${bgref}[portrait]overlay=120:100[bg1];[bg1]drawtext=text='[ $name ]':x=120:y=$((PSIZE + 140)):fontsize=42:fontcolor=$color:font=Monospace:\${TEXTBOX},drawtext=textfile='$tf':x=\${textx}:y=160:fontsize=32:fontcolor=0xf8f8f2:font=Monospace:line_spacing=14:\${TEXTBOX}[vout]"
+    ffmpeg -y -v error -loop 1 -t "$dur" -i "$portrait" "\${bgargs[@]}" -i "build/$i.wav" \\
+      -filter_complex "$fc" -map "[vout]" -map 2:a \\
+      -c:v libx264 -preset fast -pix_fmt yuv420p -c:a aac -shortest "build/$i.mp4"
+  else
+    local prepprefix=""
+    [ -n "$bgprep" ] && prepprefix="\${bgprep},"
+    ffmpeg -y -v error "\${bgargs[@]}" -i "build/$i.wav" \\
+      -vf "\${prepprefix}drawtext=text='[ $name ]':x=120:y=140:fontsize=46:fontcolor=$color:font=Monospace:\${TEXTBOX},drawtext=textfile='$tf':x=120:y=260:fontsize=34:fontcolor=0xf8f8f2:font=Monospace:line_spacing=16:\${TEXTBOX}" \\
+      -c:v libx264 -preset fast -pix_fmt yuv420p -c:a aac -shortest "build/$i.mp4"
+  fi
   echo "file '$i.mp4'" >> build/concat.txt
 }
 
@@ -1064,8 +1132,9 @@ seg () { # seg <idx> <NAME> <colorhex> <voice> ; reads text from build/<idx>.txt
   S.transcript.forEach((t,ix)=>{
     const i=String(ix).padStart(3,'0');
     const eof='GP_EOF_'+i;
-    sh += `cat > build/${i}.txt <<'${eof}'\n${fold(t.text,74)}\n${eof}\n`;
-    sh += `seg ${i} '${shq(sanName(t.name))}' ${t.hex||'0xf8f8f2'} '${shq(t.voice||'en_US-lessac-medium')}'\n\n`;
+    const wrapw = t.sid ? 48 : 74;
+    sh += `cat > build/${i}.txt <<'${eof}'\n${fold(t.text,wrapw)}\n${eof}\n`;
+    sh += `seg ${i} '${shq(sanName(t.name))}' ${t.hex||'0xf8f8f2'} '${shq(t.voice||'en_US-lessac-medium')}' '${shq(t.sid||'')}'\n\n`;
   });
   sh += `ffmpeg -y -v error -f concat -safe 0 -i build/concat.txt -c copy episode.mp4
 echo "=========================================="
@@ -1185,6 +1254,7 @@ document.addEventListener('keydown', e=>{ if (e.key==='Escape' && tourIdx>=0) to
     TOPICS = await (await fetch('/api/topics')).json();
     log(`topic bank loaded: ${TOPICS.length} theses (${TOPICS.filter(t=>t.cat==='serious').length} serious / ${TOPICS.filter(t=>t.cat==='absurd').length} absurd)`);
   }catch(e){ log('topic bank unavailable: '+e.message); }
+  await loadCharacterMeta();
   loadCast();
   loadModels();
   log('GHOST PROTOCOL studio online.');
