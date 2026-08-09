@@ -1,5 +1,22 @@
 # The Ghost Protocol — Character Registry & Personality Matrix
 
+> **⚠️ SUPERSEDED — this is the original planning draft, not the implementation.**
+> The real, working registry is [`characters.json`](characters.json) (structured data,
+> loaded live by the app via `/api/characters`) plus a per-character identity doc in
+> [`characters/`](characters/) (`characters/<sid>.md`, styled after this platform's
+> `SOUL.md` convention). Two things below are **factually wrong** relative to what's
+> actually running, kept here only for planning history:
+> - **AI models:** `claude-opus-5` / `claude-sonnet-5` are **not wired up** — no real
+>   Anthropic key exists in Bifrost (checked directly against its provider config).
+>   The real assignments use only what's actually working: Ollama (local, free) and
+>   Groq (free-tier) — see `characters.json` for the real per-character models.
+> - **Image paths:** `images/*_gilliam.png` don't exist. Real portraits are
+>   `assets/portraits/<sid>.png` (transparent cutouts), `assets/backdrops/<format>.jpg`
+>   for scene backgrounds.
+>
+> Everything else here (archetypes, humor styles, voices, personality traits) reflects
+> real design intent and mostly matches what shipped.
+
 ## Overview
 
 This document defines the complete character cast for **The Ghost Protocol** AI debate show runner. Each of the 13 unique characters is mapped to:
