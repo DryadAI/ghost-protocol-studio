@@ -26,7 +26,7 @@ Put the key in the API KEY field (or leave blank if Bifrost holds keys). TEST CO
 
 1. **Socratic Stress-Test** — SUBROUTINE_ALPHA (interrogator) vs SUBROUTINE_BETA (defender), N rounds, SYSTEM_KERNEL verdict with fallacy detection.
 2. **Round Table** — PROTOCOL-7 (deadpan literalist), M.I.R-A (techno-optimist), CYNIC.EXE (doom-poster) discuss the topic; after each round the run *pauses* and each human co-host (set names in 01 // FORMAT) types banter that feeds the next AI turns. Kernel closes with "Best Line of the Night."
-3. **Grand Tribunal** — AUDIT-9 prosecutes the thesis, ADVOCATE-0 defends, SUBJECT-X testifies; openings, N examination rounds, closings, Kernel ruling, then a human jury verdict prompt.
+3. **Grand Tribunal** — AUDIT-9 prosecutes the thesis, ADVOCATE-0 defends, SUBJECT-X testifies; openings, N examination rounds, closings, Kernel ruling, then a human jury verdict prompt. Optionally **CALL A STAR WITNESS** (01 // FORMAT, tribunal only) — name a witness and give them a background, and they're called to the stand after the accused's examination: prosecution questions them, defense cross-examines. Fully AI-voiced and editable in 02 // CAST like any other speaker.
 4. **Triad Synthesis** — STOIC-1, NIHIL-0, UTIL-3 argue N rounds; SYNTHESIS_CORE forges the compromise position.
 
 Every cast member's name, system prompt, model override, and Piper voice is editable in 02 // CAST. Every transcript bubble is click-to-edit; RE-ROLL regenerates a line in context; CUT deletes it.

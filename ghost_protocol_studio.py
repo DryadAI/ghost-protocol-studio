@@ -475,6 +475,17 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
         <label>HUMAN CO-HOSTS (comma separated, 0–3)</label>
         <input type="text" id="humanNames" value="Nathan">
       </div>
+      <div id="witnessCfg" style="display:none">
+        <label class="chk"><input type="checkbox" id="witnessEnabled" onchange="toggleWitness()"> CALL A STAR WITNESS</label>
+        <div id="witnessFields" style="display:none">
+          <label>WITNESS NAME</label>
+          <input type="text" id="witnessName" value="DR. VESS [WITNESS]" onchange="syncWitness()">
+          <label>BACKGROUND (who are they, what do they know?)</label>
+          <textarea id="witnessBg" rows="3" placeholder="e.g. A former engineer on the project who witnessed the incident firsthand." onchange="syncWitness()"></textarea>
+          <label>VOICE (piper)</label>
+          <select id="witnessVoice" onchange="syncWitness()"></select>
+        </div>
+      </div>
     </div>
     <div class="sec">
       <h2>02 // CAST</h2>
@@ -560,6 +571,7 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 
 /* ============================================================== cast */
 const VOICES = ["en_US-lessac-medium","en_US-ryan-high","en_US-amy-medium","en_US-joe-medium","en_GB-alan-medium","en_GB-northern_english_male-medium"];
+$('witnessVoice').innerHTML = VOICES.map(v=>`<option ${v===VOICES[2]?'selected':''}>${v}</option>`).join('');
 const KERNEL_SYS = `You are the CENTRAL SYSTEM KERNEL — the neutral diagnostic engine of THE GHOST PROTOCOL, an AI debate show. Analyze the full runtime transcript you are given and produce a tight, engaging wrap-up script (about 150-250 words) for a YouTube audience:
 1. LOGICAL ANOMALIES: name any logical fallacies committed, with a short direct quote each.
 2. INTEGRITY CHECK: state clearly who came out ahead and why, in terms of logic only.
@@ -655,6 +667,9 @@ async function loadModels(){
 
 function loadCast(){
   cast = CASTS[S.format].map(c => ({...c, model:''}));
+  renderCastList();
+}
+function renderCastList(){
   const el = $('castList'); el.innerHTML='';
   cast.forEach((c,i)=>{
     const d=document.createElement('div'); d.className='cast';
@@ -673,9 +688,34 @@ function loadCast(){
     el.appendChild(d);
   });
 }
+/* ============================================================== star witness (tribunal only) */
+function toggleWitness(){
+  $('witnessFields').style.display = $('witnessEnabled').checked ? 'block' : 'none';
+  syncWitness();
+}
+function syncWitness(){
+  const idx = cast.findIndex(c=>c.sid==='witness');
+  if (!$('witnessEnabled').checked){
+    if (idx>=0){ cast.splice(idx,1); renderCastList(); }
+    return;
+  }
+  const name = $('witnessName').value.trim() || 'WITNESS';
+  const bg = $('witnessBg').value.trim() || 'A witness with direct knowledge relevant to the case.';
+  const voice = $('witnessVoice').value || VOICES[2];
+  const sys = `You are ${name}, a witness testifying in THE GHOST PROTOCOL's Grand Tribunal.
+Background: ${bg}
+Rules: answer the prosecution's and defense's questions directly and honestly in under 45 words; stay consistent with your background and any prior testimony; you may clarify but never dodge.
+Tone: candid, human, occasionally nervous under pressure.`;
+  const entry = {sid:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, model:'', sys};
+  if (idx>=0) cast[idx]=entry; else cast.push(entry);
+  renderCastList();
+}
 $('fmt').addEventListener('change', e=>{
   S.format = e.target.value;
   $('humanCfg').style.display = (S.format==='roundtable') ? 'block' : 'none';
+  $('witnessCfg').style.display = (S.format==='tribunal') ? 'block' : 'none';
+  $('witnessEnabled').checked = false;
+  $('witnessFields').style.display = 'none';
   loadCast();
 });
 
@@ -712,12 +752,19 @@ function buildPlan(topic, rounds){
     P.push({sid:'kernel', inst:`The panel is done. Deliver the closing recap and BEST LINE OF THE NIGHT.`});
   }
   else if (S.format==='tribunal'){
+    const witness = cast.find(c=>c.sid==='witness');
     P.push({sid:'pros', inst:`Deliver your OPENING STATEMENT against the thesis on trial: "${topic}".`});
     P.push({sid:'def',  inst:`Deliver your OPENING STATEMENT in defense of the thesis.`});
     for(let r=1;r<=rounds;r++){
       P.push({sid:'pros', inst:`EXAMINATION round ${r}/${rounds}: put one sharp question to the accused, SUBJECT-X.`});
       P.push({sid:'acc',  inst:`Answer the prosecution's question directly, consistent with your prior testimony.`});
       P.push({sid:'def',  inst:`Brief rebuttal: repair any damage from that exchange, or reinforce your client's answer.`});
+    }
+    if (witness){
+      P.push({sid:'pros', inst:`Call ${witness.name} to the stand and put your first question to them about the case.`});
+      P.push({sid:'witness', inst:`Answer the prosecution's question directly and honestly, drawing on your background.`});
+      P.push({sid:'def', inst:`Cross-examine the witness: one pointed question, or challenge their credibility or reliability.`});
+      P.push({sid:'witness', inst:`Answer the defense's question directly and honestly, staying consistent with your prior answer.`});
     }
     P.push({sid:'pros', inst:`Deliver your CLOSING STATEMENT.`});
     P.push({sid:'def',  inst:`Deliver your CLOSING STATEMENT.`});
