@@ -1021,6 +1021,73 @@ def run_episode(ep: "Episode"):
         write_transcript(ep)
 
 
+# =============================================================================
+#  THE CREW — hired crew souls doing production work on the bus.
+#  3.1: SPLICE, the editor. It only ever *proposes*; every cut needs a human yes.
+# =============================================================================
+def crew_member(sid: str) -> dict:
+    return next((m for m in scan_show()["crew"] if m["sid"] == sid), None)
+
+
+SIM_CUT_WHYS = ["SLOW.", "REPEAT.", "EARNED-NOTHING.", "FLAB.", "DARLING."]
+
+
+def parse_cuts(text: str, valid: set) -> list:
+    """SPLICE answers `<seq> <ONE-WORD>` per line. Be forgiving about the rest."""
+    out, seen = [], set()
+    for line in text.splitlines():
+        m = re.match(r"^\D*(\d+)\s*[|:\-–—\s]\s*([A-Za-z][A-Za-z-]*)", line.strip())
+        if not m:
+            continue
+        seq, why = int(m.group(1)), m.group(2).upper().rstrip(".")
+        if seq in valid and seq not in seen:
+            seen.add(seq)
+            out.append({"seq": seq, "why": why + "."})
+    return out
+
+
+def editor_pass(ep: "Episode"):
+    """SPLICE reads the cut and proposes evictions, one word of justification each."""
+    splice = crew_member("splice")
+    turns = ep.transcript()
+    if len(turns) < 3:
+        ep.emit("splice", "note", {"op": "editor_pass_done", "proposals": 0, "why": "nothing to cut"})
+        return
+    ep.emit("splice", "note", {"op": "editor_pass_start", "lines": len(turns),
+                               "editor": (splice or {}).get("name", "SPLICE (built-in)")})
+    proposals = []
+    if ep.meta.get("sim") or not splice:
+        # Canned pass: every third line, never the closer — SPLICE cuts on principle.
+        for i, t in enumerate(turns):
+            if i % 3 == 2 and i < len(turns) - 1:
+                proposals.append({"seq": t["seq"], "why": SIM_CUT_WHYS[len(proposals) % len(SIM_CUT_WHYS)]})
+    else:
+        rt = ep.runtime
+        numbered = "\n".join(f"{t['seq']} | {t['name']}: {t['text']}" for t in turns)
+        res = proxy_chat({
+            "endpoint": rt.get("endpoint") or DEFAULT_ENDPOINT, "api_key": rt.get("api_key") or DEFAULT_KEY,
+            "model": rt.get("model") or DEFAULT_MODEL, "temperature": 0.2,
+            "messages": [{"role": "system", "content": splice["sys"]},
+                         {"role": "user", "content":
+                          f"THE CUT SO FAR (one line per turn, prefixed by its id):\n{numbered}\n\n"
+                          "Propose the evictions. One line per cut, formatted exactly:\n"
+                          "<id> <ONE-WORD-JUSTIFICATION>\n\n"
+                          "Nothing else — no preamble, no explanation, no line you are not cutting. "
+                          "Never cut the closing line, and never cut a setup whose payoff survives."}]})
+        if not res.get("ok"):
+            ep.emit("splice", "note", {"op": "error", "why": res.get("error", "")})
+            ep.emit("splice", "note", {"op": "editor_pass_done", "proposals": 0})
+            return
+        proposals = parse_cuts(res["text"], {t["seq"] for t in turns[:-1]})
+    by_seq = {t["seq"]: t for t in turns}
+    for p in proposals:
+        line = by_seq[p["seq"]]
+        ep.emit("splice", "approval_request",
+                {"kind": "cut_proposal", "seq": p["seq"], "why": p["why"],
+                 "name": line.get("name"), "text": line.get("text", "")[:160]})
+    ep.emit("splice", "note", {"op": "editor_pass_done", "proposals": len(proposals)})
+
+
 def write_transcript(ep: "Episode"):
     """transcript.json is derived from the bus, never authored directly."""
     data = {"show": "THE GHOST PROTOCOL", "episode": ep.id, "format": ep.meta.get("format"),
@@ -1168,6 +1235,18 @@ class Handler(BaseHTTPRequestHandler):
             out = render_episode(body)
         elif self.path == "/api/episode/start":
             out = start_episode(body)
+        elif self.path == "/api/episode/editor":
+            ep = get_episode(body.get("id", ""))
+            if not ep:
+                out = {"ok": False, "error": "no such episode"}
+            elif ep.meta.get("state") not in ("post", "rendered"):
+                out = {"ok": False, "error": "the editor works on a finished cut — let the run end first"}
+            else:
+                if not ep.runtime:      # episode loaded from disk: no creds in memory, use the defaults
+                    ep.runtime = {"endpoint": body.get("endpoint"), "api_key": body.get("api_key"),
+                                  "model": body.get("model"), "sim": ep.meta.get("sim")}
+                threading.Thread(target=editor_pass, args=(ep,), daemon=True, name=f"splice-{ep.id}").start()
+                out = {"ok": True}
         elif self.path in ("/api/episode/input", "/api/episode/abort", "/api/episode/event"):
             ep = get_episode(body.get("id", ""))
             if not ep:
@@ -1221,6 +1300,9 @@ header h1 b{color:var(--green)}
 .led.wait{background:var(--yellow);box-shadow:0 0 8px var(--yellow)}
 #statusText{color:var(--dim);font-size:12px;letter-spacing:1px}
 #epLabel{color:var(--dim);font-size:11px;letter-spacing:1px;border:1px solid var(--line);padding:2px 8px;margin-left:10px}
+.turn.proposed .txt{text-decoration:line-through;opacity:.5;border-left-color:var(--orange)!important}
+.turn.proposed .who{opacity:.6}
+.cutWhy{color:var(--orange);font-size:10px;letter-spacing:1px;margin-right:8px}
 .ep{border:1px solid var(--line);padding:6px 8px;margin-bottom:4px;font-size:11px;cursor:pointer;display:flex;gap:8px;align-items:center;white-space:nowrap}
 .ep:hover{border-color:var(--cyan)}
 .epState{font-size:9px;letter-spacing:1px;padding:1px 5px;border:1px solid var(--line);color:var(--dim);margin-left:auto}
@@ -1438,7 +1520,11 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
   <!-- ================= EXPORT ================= -->
   <div id="right">
     <div class="sec">
-      <h2>04 // EXPORT</h2>
+      <h2>04 // POST &amp; EXPORT</h2>
+      <button class="b" id="btnEditor" onclick="editorPass()" title="SPLICE reads the cut and proposes evictions">✂ EDITOR PASS — SPLICE</button>
+      <div style="font-size:10px;color:var(--dim);line-height:1.5;margin:4px 0 10px">
+        The editor only <b>proposes</b>. Approve or keep each cut; when none are left outstanding the survivors become the <b>locked cut</b>.
+      </div>
       <button class="b" onclick="dlTranscript('json')">TRANSCRIPT .JSON</button>
       <button class="b" onclick="dlTranscript('txt')">TRANSCRIPT .TXT</button>
       <button class="b go" id="btnRender" onclick="renderEpisode()">▶ RENDER EPISODE.MP4</button>
@@ -1495,6 +1581,7 @@ const S = {
   casting:{},              // format -> {slotId: hired sid} — who sits in which chair
   epId:null,               // episode being tailed
   busAt:0,                 // bus offset we have consumed
+  editorPass:false,        // SPLICE is working — keep tailing past the end of the run
   replay:false,            // tailing a finished episode read-only
   tailTimer:null,
   awaiting:null,           // the human turn currently blocking the server loop
@@ -1823,14 +1910,17 @@ function setStatus(txt, cls){
 function renderTurn(t){
   const feed=$('feed');
   const d=document.createElement('div');
-  d.className='turn'+(t.human?' human':'');
+  d.className='turn'+(t.human?' human':'')+(t.proposal?' proposed':'');
   d.dataset.seq = t.seq;
+  const tools = t.proposal
+    ? `<span class="cutWhy">✂ SPLICE: ${esc(t.proposal.why)}</span>
+       <button onclick="approveCut(${t.seq})">✓ APPROVE CUT</button><button onclick="keepLine(${t.seq})">✕ KEEP IT</button>`
+    : `${t.human?'':`<button onclick="reroll(${t.seq})">↻ RE-ROLL</button>`}<button onclick="delTurn(${t.seq})">✕ CUT</button>`;
   d.innerHTML = `
     <div class="who" style="color:${t.color}">${esc(t.name)}</div>
-    <div class="txt" style="border-left-color:${t.color}" contenteditable="${S.replay?'false':'true'}">${esc(t.text)}</div>
-    <div class="tools">${S.replay?'<span style="color:var(--dim)">replay — read only</span>'
-      :`${t.human?'':`<button onclick="reroll(${t.seq})">↻ RE-ROLL</button>`}<button onclick="delTurn(${t.seq})">✕ CUT</button>`}</div>`;
-  if (!S.replay) d.querySelector('.txt').addEventListener('blur', ev=>{
+    <div class="txt" style="border-left-color:${t.color}" contenteditable="${S.replay||t.proposal?'false':'true'}">${esc(t.text)}</div>
+    <div class="tools">${S.replay?'<span style="color:var(--dim)">replay — read only</span>':tools}</div>`;
+  if (!S.replay && !t.proposal) d.querySelector('.txt').addEventListener('blur', ev=>{
     const text = ev.target.innerText.trim();
     const cur = S.transcript.find(x=>x.seq===t.seq);
     if (!cur || text===cur.text) return;
@@ -1896,6 +1986,10 @@ function applyEvent(ev){
     }
     if (b.note) log(`${S.epId} ${b.state}${b.note?': '+b.note:''}`);
   }
+  else if (ev.type==='approval_request' && b.kind==='cut_proposal'){
+    const t = S.transcript.find(t=>t.seq===b.seq);
+    if (t){ t.proposal = {ref:ev.seq, why:b.why}; rerenderFeed(); }
+  }
   else if (ev.type==='approval_request' && b.kind==='human_turn'){
     S.awaiting = b;
     if (!S.replay){
@@ -1907,7 +2001,17 @@ function applyEvent(ev){
   else if (ev.type==='note'){
     if (b.op==='cut'){ const i=S.transcript.findIndex(t=>t.seq===b.seq); if(i>=0){ S.transcript.splice(i,1); rerenderFeed(); } }
     else if (b.op==='edit' || b.op==='retake'){ const t=S.transcript.find(t=>t.seq===b.seq); if(t){ t.text=b.text; rerenderFeed(); } }
-    else if (b.op==='error' || b.op==='fault'){ unthink(); sysline('— ENGINE FAULT —'); log('ERROR: '+(b.why||'')); setStatus('ERROR — see system log','err'); }
+    else if (b.op==='keep'){ const t=S.transcript.find(t=>t.seq===b.seq); if(t){ delete t.proposal; rerenderFeed(); } }
+    else if (b.op==='editor_pass_start'){ sysline(`— ${b.editor||'SPLICE'} IS IN THE ROOM (${b.lines} lines) —`); thinking('SPLICE','var(--orange)'); }
+    else if (b.op==='editor_pass_done'){
+      unthink(); S.editorPass=false;
+      sysline(b.proposals ? `— ${b.proposals} CUT${b.proposals===1?'':'S'} PROPOSED — approve or keep each —`
+                          : `— SPLICE HAS NO NOTES${b.why?' ('+b.why+')':''} —`);
+      log(`editor pass: ${b.proposals} proposal(s)`);
+      $('btnEditor').disabled = false;
+    }
+    else if (b.op==='error' || b.op==='fault'){ unthink(); S.editorPass=false; $('btnEditor').disabled=false;
+      sysline('— ENGINE FAULT —'); log('ERROR: '+(b.why||'')); setStatus('ERROR — see system log','err'); }
     else if (b.op==='skip') log(`skipped ${b.sid}: ${b.why}`);
   }
   else if (ev.type==='retake'){
@@ -1925,10 +2029,11 @@ async function pollBus(){
     if (!d.ok) throw new Error(d.error||'bus unavailable');
     d.events.forEach(applyEvent);
     S.busAt = d.next;
-    if (d.state==='running' && !S.awaiting && S.transcript.length) thinking('…','var(--dim)');
-    if (d.state==='post' || d.state==='rendered') return endRun();
+    if (S.running && d.state==='running' && !S.awaiting && S.transcript.length) thinking('…','var(--dim)');
+    if (S.running && (d.state==='post' || d.state==='rendered')) endRun();
   }catch(e){ log('bus poll failed: '+e.message); }
-  S.tailTimer = setTimeout(pollBus, 600);
+  // Keep tailing while the stage manager is working, or while a crew agent is.
+  if (S.running || S.editorPass) S.tailTimer = setTimeout(pollBus, 600);
 }
 function startTail(id, replay){
   clearTimeout(S.tailTimer);
@@ -2042,6 +2147,50 @@ async function reroll(seq){
     await busEvent('retake', {seq, text});           // the retake is on the record
   }catch(e){ log('RE-ROLL ERROR: '+e.message); }
   unthink();
+}
+
+/* ---------------------------------------------------------------- 3.1 SPLICE: the editor pass */
+async function editorPass(){
+  if (S.running) return alert('Let the run finish first — SPLICE works on a finished cut.');
+  if (!S.epId) return alert('No episode loaded.');
+  if (S.replay) return alert('This is a replay. Open a live episode to edit it.');
+  if (!S.transcript.length) return alert('Nothing to cut.');
+  $('btnEditor').disabled = true;
+  S.editorPass = true;
+  try{
+    const r = await fetch('/api/episode/editor',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:S.epId, endpoint:$('endpoint').value.trim(), api_key:$('apikey').value,
+                           model:$('model').value.trim()})});
+    const j = await r.json();
+    if (!j.ok) throw new Error(j.error);
+    pollBus();                       // the pass runs on the server; watch it land on the bus
+  }catch(e){
+    S.editorPass=false; $('btnEditor').disabled=false;
+    log('editor pass failed: '+e.message);
+  }
+}
+async function approveCut(seq){
+  const t = S.transcript.find(x=>x.seq===seq); if(!t) return;
+  const ref = t.proposal ? t.proposal.ref : '';
+  const i = S.transcript.indexOf(t);
+  S.transcript.splice(i,1); rerenderFeed();
+  await busEvent('note', {op:'cut', seq, ref, by:'splice'});
+  lockIfSettled();
+}
+async function keepLine(seq){
+  const t = S.transcript.find(x=>x.seq===seq); if(!t) return;
+  const ref = t.proposal ? t.proposal.ref : '';
+  delete t.proposal; rerenderFeed();
+  await busEvent('note', {op:'keep', seq, ref, by:'director'});
+  lockIfSettled();
+}
+/* Once every proposal has an answer, the surviving lines are the locked cut —
+   the transcript the exporter and the renderer use. */
+async function lockIfSettled(){
+  if (S.transcript.some(t=>t.proposal)) return;
+  await busEvent('artifact', {kind:'locked_cut', turns:S.transcript.length});
+  sysline(`— LOCKED CUT: ${S.transcript.length} lines —`);
+  log('locked cut written to transcript.json');
 }
 
 /* ---------------------------------------------------------------- episode shelf */
