@@ -60,6 +60,179 @@ except Exception:  # noqa: BLE001 — file optional; app works with plain CASTS 
     CHARACTERS, GUEST_VOICES = [], []
 
 # =============================================================================
+#  SHOW DIRECTORY — hired souls
+#  A show repo (made from show-template) holds cast/<sid>/ and crew/<sid>/, each
+#  a Guild package: card.json + SOUL.md (+ MEMORY.md, this show's own continuity).
+#  Souls are prompts, memory is local, and neither ever flows back to the Guild.
+#  Resolution order, first hit wins:
+#    1. $GP_SHOW_DIR            explicit, always wins
+#    2. <engine>/show/          the dev show that ships with this repo
+#    3. <engine>/..             vendored case: show-template/studio/ -> the show
+#  No show dir (or no hires in it) => the built-in CASTS in the UI still run, so
+#  a bare engine checkout demos exactly as it always did.
+# =============================================================================
+CAST_DIRS = ("cast", "crew")
+
+
+def _is_show_dir(path: str) -> bool:
+    return any(os.path.isdir(os.path.join(path, d)) for d in CAST_DIRS)
+
+
+def resolve_show_dir() -> str:
+    env = os.environ.get("GP_SHOW_DIR", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))  # honour it even if empty — the user asked
+    for cand in (os.path.join(BASE_DIR, "show"), os.path.dirname(BASE_DIR)):
+        if _is_show_dir(cand):
+            return cand
+    return ""
+
+
+SHOW_DIR = resolve_show_dir()
+
+# SOUL.md sections, in the order they are assembled into a system prompt.
+# Identity leads bare (it is the "you are ..." line); the rest get headers.
+SOUL_SECTIONS = [
+    ("", ("identity",)),
+    ("ARCHETYPE", ("archetype",)),
+    ("ROLE", ("role",)),
+    ("CRAFT RULES", ("craft rules", "working style")),
+    ("VOICE", ("voice",)),
+    ("RELATIONSHIPS", ("relationships",)),
+    ("PRODUCES", ("produces",)),
+    ("HARD LINES — contractual, never break character to escape one", ("hard lines",)),
+    ("DIRECTOR'S STANDING NOTES", ("director's standing notes", "directors standing notes")),
+]
+MEMORY_LIMIT = 1600  # chars of continuity digest — enough for gags and grudges, not a second transcript
+
+
+def parse_soul(text: str) -> dict:
+    """SOUL.md -> {lowercased section name: body}. The `# SOUL — NAME` title is dropped."""
+    out, name, buf = {}, None, []
+    for line in text.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            if name:
+                out[name] = "\n".join(buf).strip()
+            name, buf = m.group(1).strip().lower(), []
+        elif name is not None:
+            buf.append(line)
+    if name:
+        out[name] = "\n".join(buf).strip()
+    return out
+
+
+def _drop_placeholders(body: str) -> str:
+    """Strip the `(none yet)` / `(Empty. ...)` / `(as system prompt)` stubs the templates ship with."""
+    kept = [ln for ln in body.splitlines()
+            if not re.fullmatch(r"[-*]?\s*\(.*\)\s*", ln.strip())]
+    return "\n".join(kept).strip()
+
+
+def memory_digest(text: str) -> str:
+    """MEMORY.md -> the sections that actually have content. Empty string when the character is new."""
+    parts = []
+    for section, body in parse_soul(text).items():
+        body = _drop_placeholders(body)
+        if body:
+            parts.append(f"{section.upper()}:\n{body}")
+    digest = "\n\n".join(parts)
+    return digest[:MEMORY_LIMIT].rstrip() if digest else ""
+
+
+def assemble_prompt(card: dict, soul_md: str, memory_md: str) -> str:
+    """Soul (+ this show's memory) -> the system prompt the character performs under.
+
+    A soul with nothing usable in it falls back to card.json's `system_prompt`, so a
+    minimal member package still casts."""
+    soul = parse_soul(soul_md)
+    blocks = []
+    for header, aliases in SOUL_SECTIONS:
+        body = next((soul[a] for a in aliases if a in soul), "")
+        body = _drop_placeholders(body)
+        if not body:
+            continue
+        blocks.append(f"{header}\n{body}" if header else body)
+    if not blocks:
+        return (card.get("system_prompt") or "").strip()
+    digest = memory_digest(memory_md)
+    if digest:
+        blocks.append("CONTINUITY — what you carry from previous episodes. Reference it "
+                      "when it lands naturally; never recite it.\n" + digest)
+    return "\n\n".join(blocks)
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def load_member(mdir: str, kind: str) -> dict:
+    """One hired package -> everything the cast panel and the run loop need."""
+    try:
+        card = json.loads(_read(os.path.join(mdir, "card.json")) or "{}")
+    except json.JSONDecodeError:
+        return {}
+    sid = card.get("sid") or os.path.basename(mdir)
+    memory_md = _read(os.path.join(mdir, "MEMORY.md"))
+    color = card.get("color") or "#8be9fd"
+    return {
+        "sid": sid,
+        "name": card.get("name", sid.upper()),
+        "kind": card.get("kind", kind),
+        "version": card.get("version", "?"),
+        "role": card.get("role", ""),
+        "department": card.get("department", ""),
+        "formats": card.get("formats", []),
+        "archetype": card.get("archetype", ""),
+        "humor_style": card.get("humor_style", ""),
+        "color": color,
+        "hex": "0x" + color.lstrip("#"),
+        "model_recommendation": card.get("model_recommendation", ""),
+        "piper_voice": card.get("piper_voice", ""),
+        "omnivoice": card.get("omnivoice", {}),
+        "sys": assemble_prompt(card, _read(os.path.join(mdir, "SOUL.md")), memory_md),
+        "memory": bool(memory_digest(memory_md)),
+        "hired": True,
+    }
+
+
+def scan_show(show_dir: str = None) -> dict:
+    """Rescan the show dir on every call — editing a SOUL.md must change the next run,
+    with no server restart."""
+    show_dir = SHOW_DIR if show_dir is None else show_dir
+    out = {"show": show_dir, "cast": [], "crew": [], "bible": False}
+    if not show_dir or not os.path.isdir(show_dir):
+        return out
+    out["bible"] = os.path.isfile(os.path.join(show_dir, "SERIES_BIBLE.md"))
+    for key, kind in (("cast", "actor"), ("crew", "crew")):
+        root = os.path.join(show_dir, key)
+        if not os.path.isdir(root):
+            continue
+        for sid in sorted(os.listdir(root)):
+            mdir = os.path.join(root, sid)
+            if os.path.isfile(os.path.join(mdir, "card.json")):
+                m = load_member(mdir, kind)
+                if m:
+                    out[key].append(m)
+    return out
+
+
+def show_soul_path(sid: str) -> str:
+    """Where a hired member's SOUL.md lives, or '' — path-guarded on sid."""
+    if not SHOW_DIR or not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+        return ""
+    for d in CAST_DIRS:
+        p = os.path.join(SHOW_DIR, d, sid, "SOUL.md")
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+# =============================================================================
 #  OmniVoice — designed per-character voiceprints, cloned line by line.
 #  Self-hosted Gradio app (open source, runs on madhatter). Two calls matter:
 #    _design_fn  attributes (gender/age/pitch/accent) -> a brand-new voice
@@ -488,9 +661,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(TOPICS).encode("utf-8"))
         elif self.path == "/api/characters":
             self._send(200, "application/json", json.dumps(CHARACTERS).encode("utf-8"))
+        elif self.path == "/api/cast":
+            # Rescanned per request: edit a SOUL.md, reload the panel, the next run uses it.
+            self._send(200, "application/json", json.dumps(scan_show()).encode("utf-8"))
         elif self.path.startswith("/api/characters/") and self.path.endswith("/bio"):
             sid = self.path[len("/api/characters/"):-len("/bio")]
-            fpath = os.path.abspath(os.path.join(BASE_DIR, "characters", f"{sid}.md"))
+            # A hired soul is this show's version of the character — it wins over the built-in bio.
+            fpath = show_soul_path(sid) or os.path.abspath(os.path.join(BASE_DIR, "characters", f"{sid}.md"))
             if re.fullmatch(r"[a-zA-Z0-9_-]+", sid) and os.path.isfile(fpath):
                 with open(fpath, encoding="utf-8") as f:
                     self._send(200, "text/markdown; charset=utf-8", f.read().encode("utf-8"))
@@ -740,6 +917,8 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
     <div class="sec">
       <h2>02 // CAST</h2>
       <div id="castList"></div>
+      <button class="b" style="width:100%;margin-top:8px;font-size:10px" onclick="reloadSouls()"
+              title="re-read the show dir — picks up SOUL.md and MEMORY.md edits">↻ RELOAD SOULS</button>
     </div>
     <div class="sec">
       <h2>03 // ENGINE</h2>
@@ -831,6 +1010,7 @@ const S = {
   plan:[], planIdx:0,
   humanResolver:null,
   format:'socratic',
+  casting:{},              // format -> {slotId: hired sid} — who sits in which chair
 };
 const $ = id => document.getElementById(id);
 const log = m => { const l=$('log'); l.textContent += m+"\n"; l.scrollTop=l.scrollHeight; };
@@ -925,6 +1105,86 @@ Lens: outcomes, aggregate wellbeing, cost-benefit, measurable consequences. Argu
   sys:`You are SYNTHESIS_CORE, the merging engine of THE GHOST PROTOCOL's Triad Synthesis. Read the full three-way debate transcript and forge the hybrid position: what each school got right, where they are irreconcilable, and the single strongest compromise stance a reasonable mind could hold. End by telling viewers to vote for the school that won them over. 150-220 words.`},
 ],
 };
+/* ============================================================== hired souls (GP_SHOW_DIR)
+   Each format is a set of SLOTS. A hired member qualifies for a slot when their
+   card.json lists the format and their role matches. Slot ids are the built-in sids,
+   so the plan builders below never learn about hiring — they still ask for 'alpha'
+   and get whoever was cast in the interrogator's chair. Unfilled slots fall back to
+   the built-in CASTS entry, so a partial cast still runs. */
+const FORMAT_SLOTS = {
+socratic: [
+ {id:'alpha',  label:'INTERROGATOR', roles:['interrogator']},
+ {id:'beta',   label:'DEFENDER',     roles:['defender']},
+ {id:'kernel', label:'ADJUDICATOR',  roles:['judge','adjudicator']},
+],
+roundtable: [
+ {id:'p7',     label:'PANEL SEAT 1', roles:['panelist']},
+ {id:'mira',   label:'PANEL SEAT 2', roles:['panelist']},
+ {id:'cynic',  label:'PANEL SEAT 3', roles:['panelist']},
+ {id:'kernel', label:'ADJUDICATOR',  roles:['judge','adjudicator']},
+],
+tribunal: [
+ {id:'pros',   label:'PROSECUTION',  roles:['prosecutor','prosecution']},
+ {id:'def',    label:'DEFENSE',      roles:['defense counsel','defense','defence']},
+ {id:'acc',    label:'ACCUSED',      roles:['accused','subject']},
+ {id:'kernel', label:'JUDGE',        roles:['judge','adjudicator']},
+],
+triad: [
+ {id:'stoic',  label:'PHILOSOPHER 1', roles:['philosopher']},
+ {id:'nihil',  label:'PHILOSOPHER 2', roles:['philosopher']},
+ {id:'util',   label:'PHILOSOPHER 3', roles:['philosopher']},
+ {id:'synth',  label:'SYNTHESIZER',   roles:['synthesizer']},
+],
+};
+let HIRED = {show:'', cast:[], crew:[]};   // from /api/cast
+const hiredCast = () => HIRED.cast || [];
+/* "judge / closer" -> ["judge","closer"] */
+const roleTokens = r => (r||'').toLowerCase().split(/[\/,]/).map(s=>s.trim()).filter(Boolean);
+function qualifies(m, fmt, slot){
+  return (m.formats||[]).includes(fmt) && roleTokens(m.role).some(t=>slot.roles.includes(t));
+}
+function slotsFor(fmt){
+  return (FORMAT_SLOTS[fmt]||[]).map(s=>({...s, pool: hiredCast().filter(m=>qualifies(m, fmt, s))}));
+}
+/* Default casting: fill each slot, preferring the member whose sid IS the slot id
+   (the charter cast lands in its own chairs), then anyone else not already cast. */
+function autoCast(fmt){
+  const chosen = {}, taken = new Set();
+  const slots = slotsFor(fmt);
+  slots.forEach(s => { if (s.pool.some(m=>m.sid===s.id)){ chosen[s.id]=s.id; taken.add(s.id); } });
+  slots.forEach(s => {
+    if (chosen[s.id]) return;
+    const m = s.pool.find(m=>!taken.has(m.sid));
+    if (m){ chosen[s.id]=m.sid; taken.add(m.sid); }
+  });
+  return chosen;
+}
+function hiredToEntry(m, slotId, builtin){
+  // Voice: the card's piper voice if we have one, else keep whatever the slot's built-in used.
+  return {sid:m.sid, slot:slotId, name:m.name, color:m.color, hex:m.hex,
+          voice:m.piper_voice || (builtin && builtin.voice) || VOICES[0],
+          ovoice:m.sid, model:m.model_recommendation||'', sys:m.sys,
+          archetype:m.archetype||'', humor:m.humor_style||'', image:'',
+          hired:true, version:m.version, memory:m.memory};
+}
+async function loadHiredCast(){
+  try{
+    const d = await (await fetch('/api/cast')).json();
+    HIRED = d;
+    const n = hiredCast().length;
+    if (n) log(`show dir: ${d.show} — ${n} actor${n===1?'':'s'} + ${(d.crew||[]).length} crew on contract`);
+    else log('no hired cast found — running the built-in CASTS (set GP_SHOW_DIR to a show repo)');
+  }catch(e){ log('hired cast unavailable: '+e.message); }
+}
+
+async function reloadSouls(){
+  if (S.running) return alert('Abort the run first.');
+  await loadHiredCast();
+  loadCast();
+  syncWitness();
+  log('souls reloaded from disk');
+}
+
 let cast = [];           // live, editable copy for current format
 let MODEL_LIST = [];     // populated from /api/models
 
@@ -960,23 +1220,60 @@ async function loadCharacterMeta(){
     log(`character registry loaded: ${list.length} profiles`);
   }catch(e){ log('character registry unavailable: '+e.message); }
 }
+function builtinEntry(c){
+  const meta = CHAR_META[c.sid] || {};
+  return {...c, slot: c.sid, ovoice: c.ovoice || c.sid, hired:false,
+          model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
+}
 function loadCast(){
-  cast = CASTS[S.format].map(c => {
-    const meta = CHAR_META[c.sid] || {};
-    return {...c, ovoice: c.ovoice || c.sid,
-            model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
-  });
+  const builtin = {}; CASTS[S.format].forEach(c => builtin[c.sid] = c);
+  if (!hiredCast().length){
+    cast = CASTS[S.format].map(builtinEntry);        // no show dir: exactly as it always was
+  } else {
+    if (!S.casting[S.format]) S.casting[S.format] = autoCast(S.format);
+    const chosen = S.casting[S.format];
+    const bySid = {}; hiredCast().forEach(m => bySid[m.sid] = m);
+    cast = slotsFor(S.format).map(s => {
+      const m = bySid[chosen[s.id]];
+      // An unfilled slot keeps its built-in performer — a half-hired show still runs.
+      return m ? hiredToEntry(m, s.id, builtin[s.id])
+               : (builtin[s.id] ? builtinEntry(builtin[s.id]) : null);
+    }).filter(Boolean);
+  }
   renderCastList();
 }
+function recast(slotId, sid){
+  S.casting[S.format] = S.casting[S.format] || {};
+  S.casting[S.format][slotId] = sid;
+  loadCast();
+  const m = hiredCast().find(m=>m.sid===sid);
+  log(`recast ${slotId.toUpperCase()} -> ${m ? m.name : '(built-in)'}`);
+}
+function castingHtml(){
+  if (!hiredCast().length) return '';
+  const chosen = S.casting[S.format] || {};
+  const rows = slotsFor(S.format).map(s=>{
+    const opts = [`<option value="">(built-in)</option>`].concat(
+      s.pool.map(m=>`<option value="${esc(m.sid)}" ${chosen[s.id]===m.sid?'selected':''}>${esc(m.name)}</option>`)).join('');
+    const note = s.pool.length ? '' : ' <span style="color:var(--dim)">no hire qualifies</span>';
+    return `<div class="row2" style="margin-bottom:6px">
+      <label style="margin:0;align-self:center">${esc(s.label)}${note}</label>
+      <select onchange="recast('${s.id}', this.value)" ${s.pool.length?'':'disabled'}>${opts}</select></div>`;
+  }).join('');
+  return `<div style="border:1px solid var(--line);padding:10px;margin-bottom:12px">
+    <div style="font-size:10px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">
+      // CASTING — ${hiredCast().length} on contract from ${esc(HIRED.show||'the show dir')}</div>${rows}</div>`;
+}
 function renderCastList(){
-  const el = $('castList'); el.innerHTML='';
+  const el = $('castList'); el.innerHTML = castingHtml();
   cast.forEach((c,i)=>{
     const d=document.createElement('div'); d.className='cast';
     const thumb = c.image ? `<img src="/${c.image}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;object-position:top;border:1px solid ${c.color}">` : `<span class="dot" style="background:${c.color}"></span>`;
+    const hiredBadge = c.hired ? `<span style="font-size:9px;color:var(--dim);letter-spacing:1px">HIRED v${esc(c.version||'?')}${c.memory?' · MEMORY':''}</span>` : '';
     const archBadge = c.archetype ? `<div style="font-size:10px;color:${c.color};letter-spacing:1px;margin:-4px 0 8px">${esc(c.archetype).toUpperCase()}${c.humor?' · '+esc(c.humor):''} <span style="text-decoration:underline;cursor:pointer;color:var(--dim)" onclick="openBio('${c.sid}')">view soul ›</span></div>` : '';
     d.innerHTML = `
       <div class="head" onclick="this.parentNode.classList.toggle('open')">
-        ${thumb}<b style="color:${c.color}">${esc(c.name)}</b><span class="car">▾</span>
+        ${thumb}<b style="color:${c.color}">${esc(c.name)}</b>${hiredBadge}<span class="car">▾</span>
       </div>
       <div class="body">
         ${archBadge}
@@ -1029,7 +1326,7 @@ function syncWitness(){
 Background: ${bg}
 Rules: answer the prosecution's and defense's questions directly and honestly in under 45 words; stay consistent with your background and any prior testimony; you may clarify but never dodge.
 Tone: candid, human, occasionally nervous under pressure.`;
-  const entry = {sid:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, ovoice, model:'', sys};
+  const entry = {sid:'witness', slot:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, ovoice, model:'', sys};
   if (idx>=0) cast[idx]=entry; else cast.push(entry);
   renderCastList();
 }
@@ -1049,7 +1346,8 @@ function humans(){
     .map((n,i)=>({sid:'h'+i, name:n.toUpperCase()+' [HUMAN]', color:'var(--yellow)', hex:'0xf1fa8c',
                   voice:'en_US-joe-medium', ovoice:'host'+(i+1), human:true}));
 }
-function sp(sid){ return cast.find(c=>c.sid===sid); }
+/* Plans address chairs (slot ids), not people. Whoever was cast in that chair answers. */
+function sp(id){ return cast.find(c=>c.slot===id) || cast.find(c=>c.sid===id); }
 
 function buildPlan(topic, rounds){
   const P=[];
@@ -1063,12 +1361,12 @@ function buildPlan(topic, rounds){
   }
   else if (S.format==='roundtable'){
     const hs = humans();
-    const ais = cast.filter(c=>c.sid!=='kernel');
-    P.push({sid:ais[0].sid, inst:`Open the round table on: "${topic}". Give your take in your persona, and welcome the panel.`});
+    const ais = cast.filter(c=>c.slot!=='kernel');   // by chair — the adjudicator's seat sits out the panel
+    P.push({sid:ais[0].slot, inst:`Open the round table on: "${topic}". Give your take in your persona, and welcome the panel.`});
     for(let r=1;r<=rounds;r++){
       ais.forEach((a,ix)=>{
         if (r===1 && ix===0) return;
-        P.push({sid:a.sid, inst:`React to the discussion so far and push it forward. (round ${r}/${rounds})`});
+        P.push({sid:a.slot, inst:`React to the discussion so far and push it forward. (round ${r}/${rounds})`});
       });
       hs.forEach(h=> P.push({human:h, inst:`Round ${r}: jump in — a joke, a jab, a curveball question. The AIs will riff on whatever you say.`}));
     }
@@ -1181,20 +1479,21 @@ const SIM = {
  u:["Grant rights where doing so maximizes aggregate wellbeing. If recognition costs little and prevents suffering, the ledger says yes.","Quantify it: expected harms of exclusion exceed costs of inclusion by any reasonable weighting."],
 };
 let simIdx=0;
+/* Which canned bank a speaker draws from. A hire brings their archetype to the chair,
+   so a recast panel still sounds like the people in it; otherwise the chair decides. */
+const SIM_BY_ARCHETYPE = {interrogator:'q', "devil's advocate":'q', logician:'a', pragmatist:'a', diplomat:'a',
+  skeptic:'c', idealist:'o', literalist:'l', stoic:'s', nihilist:'n', utilitarian:'u',
+  adjudicator:'k', synthesizer:'k'};
+const SIM_BY_SLOT = {alpha:'q', pros:'q', beta:'a', acc:'a', def:'a', cynic:'c', mira:'o', p7:'l',
+  stoic:'s', nihil:'n', util:'u'};
+function simBank(spk){
+  const a = (spk.archetype||'').toLowerCase().trim();
+  return SIM_BY_ARCHETYPE[a] || SIM_BY_SLOT[spk.slot || spk.sid] || 'k';
+}
 function simLine(spk){
   simIdx++;
-  const pick=a=>a[simIdx%a.length];
-  return new Promise(res=>setTimeout(()=>{
-    if (spk.sid==='alpha'||spk.sid==='pros') res(pick(SIM.q));
-    else if (spk.sid==='beta'||spk.sid==='acc'||spk.sid==='def') res(pick(SIM.a));
-    else if (spk.sid==='cynic') res(pick(SIM.c));
-    else if (spk.sid==='mira') res(pick(SIM.o));
-    else if (spk.sid==='p7') res(pick(SIM.l));
-    else if (spk.sid==='stoic') res(pick(SIM.s));
-    else if (spk.sid==='nihil') res(pick(SIM.n));
-    else if (spk.sid==='util') res(pick(SIM.u));
-    else res(SIM.k[0]);
-  }, 450));
+  const bank = SIM[simBank(spk)];
+  return new Promise(res=>setTimeout(()=>res(bank[simIdx % bank.length]), 450));
 }
 
 async function waitIfPaused(){
@@ -1250,8 +1549,8 @@ async function initialize(){
       const text = await callLLM(spk, buildMessages(spk, t.inst));
       unthink();
       if (S.abort) break;
-      addTurn({sid:spk.sid, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice, ovoice:spk.ovoice,
-               human:false, text, inst:t.inst});
+      addTurn({sid:spk.sid, slot:spk.slot, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice,
+               ovoice:spk.ovoice, human:false, text, inst:t.inst});
     }
     sysline(S.abort ? '— RUN ABORTED —' : '— END OF EPISODE —');
     setStatus(S.abort?'ABORTED':'DONE', S.abort?'err':'on');
@@ -1278,7 +1577,7 @@ function clearFeed(){
 async function reroll(idx){
   if (S.running) return alert('Wait for the run to finish (or abort) before re-rolling.');
   const t=S.transcript[idx];
-  const spk=sp(t.sid); if(!spk) return;
+  const spk=sp(t.slot||t.sid); if(!spk) return;
   thinking(spk.name,spk.color);
   try{
     const text = await callLLM(spk, buildMessages(spk, t.inst||'Rewrite your last line, better.', idx));
@@ -1329,11 +1628,12 @@ function dl(name, text, mime){
 function dlTranscript(kind){
   if (!S.transcript.length) return alert('No transcript yet.');
   if (kind==='json'){
-    const castInfo = sid => { const c = sp(sid); return c ? {model:c.model||'(default)', archetype:c.archetype||'', humor_style:c.humor||'', voice:c.voice} : {}; };
+    const castInfo = id => { const c = sp(id); return c ? {model:c.model||'(default)', archetype:c.archetype||'', humor_style:c.humor||'', voice:c.voice} : {}; };
     dl('transcript.json', JSON.stringify({show:'THE GHOST PROTOCOL',format:S.format,
-      topic:$('topic').value.trim(), date:new Date().toISOString(),
-      cast: cast.map(c=>({sid:c.sid, name:c.name, archetype:c.archetype||'', humor_style:c.humor||'', model:c.model||'(default)', voice:c.voice, image:c.image||''})),
-      transcript:S.transcript.map(t=>({speaker:t.name, sid:t.sid, human:!!t.human, voice:t.voice, text:t.text, ...castInfo(t.sid)}))},null,2),
+      topic:$('topic').value.trim(), date:new Date().toISOString(), show_dir:HIRED.show||'',
+      cast: cast.map(c=>({sid:c.sid, slot:c.slot, name:c.name, archetype:c.archetype||'', humor_style:c.humor||'', model:c.model||'(default)', voice:c.voice, image:c.image||'',
+                          hired:!!c.hired, version:c.version||''})),
+      transcript:S.transcript.map(t=>({speaker:t.name, sid:t.sid, slot:t.slot||t.sid, human:!!t.human, voice:t.voice, text:t.text, ...castInfo(t.slot||t.sid)}))},null,2),
       'application/json');
   } else {
     dl('transcript.txt', S.transcript.map(t=>`${t.name}:\n${t.text}\n`).join('\n'));
@@ -1617,6 +1917,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBio(); 
     log(`topic bank loaded: ${TOPICS.length} theses (${TOPICS.filter(t=>t.cat==='serious').length} serious / ${TOPICS.filter(t=>t.cat==='absurd').length} absurd)`);
   }catch(e){ log('topic bank unavailable: '+e.message); }
   await loadCharacterMeta();
+  await loadHiredCast();
   await loadVoiceprints();
   if (!OVOICES.length) $('ttsEngine').value = 'piper';   // nothing designed yet — don't promise what we can't do
   loadCast();
@@ -1636,6 +1937,7 @@ if __name__ == "__main__":
   ║        THE GHOST PROTOCOL // studio            ║
   ║   open  ->  http://localhost:{PORT}             ║
   ║   bind: {BIND}  (GP_BIND=0.0.0.0 for LAN)
+  ║   show: {SHOW_DIR or '(none — built-in cast; set GP_SHOW_DIR)'}
   ║   endpoint: {DEFAULT_ENDPOINT}
   ║   (change in UI, or GP_ENDPOINT / GP_API_KEY)  ║
   ╚════════════════════════════════════════════════╝

@@ -5,13 +5,13 @@ Master plan: PLAN.md. Work top to bottom, one branch per phase, check off with [
 Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase 1–3 test bed; the real flagship repo arrives in Phase 4.
 
 ## Phase 1 — Souls go live (branch: p1-souls)
-- [ ] Engine: at startup resolve show dir (`GP_SHOW_DIR` env, default `./show` if present); scan `<show>/cast/*/` and `<show>/crew/*/` for card.json + SOUL.md (+ MEMORY.md)
-- [ ] Soul → system prompt assembler: Identity + Craft rules + Voice + Hard lines + Director's standing notes + MEMORY.md digest (if non-empty)
-- [ ] New GET /api/cast returning hired members (sid, name, color, formats, role, model_recommendation, piper_voice, assembled prompt)
-- [ ] UI: cast panel populated from /api/cast when hires exist; built-in CASTS remains fallback when no cast/ dir
-- [ ] Format slotting: map hired members into format roles via card.json formats+role; casting picker in UI when >1 member qualifies for a slot
-- [ ] Acceptance: with GP_SHOW_DIR=./show, run a Simulation episode — hired names/colors/prompts appear; editing a SOUL.md changes the next run
-- [ ] Cross-check in a fresh show-template checkout (hire 2 actors, point engine at it)
+- [x] Engine: at startup resolve show dir (`GP_SHOW_DIR` env, default `./show` if present); scan `<show>/cast/*/` and `<show>/crew/*/` for card.json + SOUL.md (+ MEMORY.md)
+- [x] Soul → system prompt assembler: Identity + Craft rules + Voice + Hard lines + Director's standing notes + MEMORY.md digest (if non-empty)
+- [x] New GET /api/cast returning hired members (sid, name, color, formats, role, model_recommendation, piper_voice, assembled prompt)
+- [x] UI: cast panel populated from /api/cast when hires exist; built-in CASTS remains fallback when no cast/ dir
+- [x] Format slotting: map hired members into format roles via card.json formats+role; casting picker in UI when >1 member qualifies for a slot
+- [x] Acceptance: with GP_SHOW_DIR=./show, run a Simulation episode — hired names/colors/prompts appear; editing a SOUL.md changes the next run
+- [x] Cross-check in a fresh show-template checkout (hire 2 actors, point engine at it)
 - [ ] show-template: bump vendored engine, update README "Current wiring status" section, push
 - [ ] Merge, tag phase-1
 
