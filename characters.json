@@ -351,5 +351,76 @@
       }
     }
   ],
-  "_omnivoice_comment": "Per-character OmniVoice voiceprint design intent. `voice_forge.py design` calls the OmniVoice voice-design API with these attributes to synthesise assets/voices/<sid>.wav — the reference voiceprint the render pipeline clones from for every line that character speaks. `piperVoice` stays as the offline fallback engine. Re-roll a single character with `python3 voice_forge.py design --sid <sid>`; the wav on disk is the source of truth once approved."
+  "_omnivoice_comment": "Per-character OmniVoice voiceprint design intent. `voice_forge.py design` calls the OmniVoice voice-design API with these attributes to synthesise assets/voices/<sid>.wav — the reference voiceprint the render pipeline clones from for every line that character speaks. `piperVoice` stays as the offline fallback engine. Re-roll a single character with `python3 voice_forge.py design --sid <sid>`; the wav on disk is the source of truth once approved.",
+  "_guest_voices_comment": "Voiceprints for speakers who aren't cast members: the human co-hosts (Round Table banter, tribunal jury) and the tribunal's star witness. Same OmniVoice design pipeline, same assets/voices/<sid>.wav layout — they just have no system prompt, because a human writes their lines. `formats` here drives voice_forge's separation check, not casting. The co-hosts use a virtual 'cohosts' group: they must sound clearly different from each other, but they don't compete for pitch space with the AI cast — a co-host turn is announced, colour-coded yellow and named on screen, and the 80-210 Hz range cannot hold 17 voices 12 Hz apart. The witness sits in 'tribunal' proper because they are cross-examined by AUDIT-9 and ADVOCATE-0 in direct back-and-forth.",
+  "guest_voices": [
+    {
+      "sid": "host1",
+      "name": "CO-HOST 1",
+      "formats": [
+        "cohosts"
+      ],
+      "omnivoice": {
+        "gender": "Male",
+        "age": "Middle-aged",
+        "pitch": "Low",
+        "style": "Auto",
+        "accent": "American",
+        "speed": 1.0,
+        "instruct": "male, american accent, warm, conversational",
+        "signature": "Alright, hold on — you're telling me the machine actually said that out loud?"
+      }
+    },
+    {
+      "sid": "host2",
+      "name": "CO-HOST 2",
+      "formats": [
+        "cohosts"
+      ],
+      "omnivoice": {
+        "gender": "Female",
+        "age": "Middle-aged",
+        "pitch": "High",
+        "style": "Auto",
+        "accent": "British",
+        "speed": 1.02,
+        "instruct": "female, british accent, wry, quick",
+        "signature": "I want the record to show that I was on the losing side of this argument voluntarily."
+      }
+    },
+    {
+      "sid": "host3",
+      "name": "CO-HOST 3",
+      "formats": [
+        "cohosts"
+      ],
+      "omnivoice": {
+        "gender": "Male",
+        "age": "Young Adult",
+        "pitch": "High",
+        "style": "Auto",
+        "accent": "Australian",
+        "speed": 1.05,
+        "instruct": "male, australian accent, animated, amused",
+        "signature": "Mate, that is the single most confident wrong answer I have ever heard."
+      }
+    },
+    {
+      "sid": "witness",
+      "name": "STAR WITNESS",
+      "formats": [
+        "tribunal"
+      ],
+      "omnivoice": {
+        "gender": "Female",
+        "age": "Middle-aged",
+        "pitch": "Low",
+        "style": "Auto",
+        "accent": "Canadian",
+        "speed": 0.98,
+        "instruct": "female, canadian accent, careful, reluctant",
+        "signature": "I only know what I saw, and I would rather not have seen any of it, frankly."
+      }
+    }
+  ]
 }

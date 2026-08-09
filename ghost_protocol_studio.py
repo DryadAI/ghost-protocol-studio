@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -51,9 +52,167 @@ except Exception:  # noqa: BLE001 — file optional; ship a tiny fallback bank
 CHARACTERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "characters.json")
 try:
     with open(CHARACTERS_FILE, encoding="utf-8") as _f:
-        CHARACTERS = json.load(_f).get("characters", [])
+        _REG = json.load(_f)
+    CHARACTERS = _REG.get("characters", [])
+    # Human co-hosts, the jury and the star witness get voices too — they just have no soul.
+    GUEST_VOICES = _REG.get("guest_voices", [])
 except Exception:  # noqa: BLE001 — file optional; app works with plain CASTS if missing
-    CHARACTERS = []
+    CHARACTERS, GUEST_VOICES = [], []
+
+# =============================================================================
+#  OmniVoice — designed per-character voiceprints, cloned line by line.
+#  Self-hosted Gradio app (open source, runs on madhatter). Two calls matter:
+#    _design_fn  attributes (gender/age/pitch/accent) -> a brand-new voice
+#    _clone_fn   reference wav + text                 -> that voice, saying anything
+#  voice_forge.py designs each cast member's voiceprint once into assets/voices/;
+#  the renderer clones from it so a character sounds identical in every episode.
+#  Piper stays the offline fallback — nothing here is required to render.
+# =============================================================================
+OMNIVOICE_URL = os.environ.get("GP_OMNIVOICE", "https://omnivoice.madhatter.modlin.cloud").rstrip("/")
+VOICEPRINTS_DIR = os.path.join(BASE_DIR, "assets", "voices")
+OV_DESIGN_DEFAULTS = {"steps": 32, "cfg": 2.0, "denoise": True, "speed": 1.0, "duration": None}
+_OV_FN_CACHE: dict = {}
+_OV_REF_CACHE: dict = {}
+
+
+def ov_fn_index(api_name: str) -> int:
+    """fn_index for a Gradio api_name. Gradio 6's sse_v3 protocol wants the index, not the name."""
+    if not _OV_FN_CACHE:
+        with urllib.request.urlopen(f"{OMNIVOICE_URL}/config", timeout=30) as r:
+            cfg = json.load(r)
+        for i, dep in enumerate(cfg.get("dependencies", [])):
+            if dep.get("api_name"):
+                _OV_FN_CACHE[dep["api_name"]] = i
+    if api_name not in _OV_FN_CACHE:
+        raise RuntimeError(f"OmniVoice has no endpoint '{api_name}' — is {OMNIVOICE_URL} the right host?")
+    return _OV_FN_CACHE[api_name]
+
+
+def ov_predict(api_name: str, data: list, timeout: int = 300) -> list:
+    """Run one OmniVoice job: join the queue, then read the SSE stream until it completes."""
+    session = uuid.uuid4().hex
+    body = json.dumps({"data": data, "fn_index": ov_fn_index(api_name), "session_hash": session,
+                       "trigger_id": None, "event_data": None,
+                       "batched": False, "simple_format": False}).encode("utf-8")
+    req = urllib.request.Request(f"{OMNIVOICE_URL}/gradio_api/queue/join", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        join = json.load(r)
+    if not join.get("event_id"):
+        raise RuntimeError(join.get("detail") or "OmniVoice queue join failed")
+
+    with urllib.request.urlopen(
+        f"{OMNIVOICE_URL}/gradio_api/queue/data?session_hash={session}", timeout=timeout
+    ) as stream:
+        for raw in stream:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                msg = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            kind = msg.get("msg")
+            if kind == "process_completed":
+                out = msg.get("output") or {}
+                if not msg.get("success") or out.get("error"):
+                    raise RuntimeError(out.get("error") or "OmniVoice generation failed")
+                return out.get("data") or []
+            if kind == "unexpected_error":
+                raise RuntimeError(msg.get("message") or "OmniVoice backend error")
+    raise RuntimeError("OmniVoice stream ended without completing")
+
+
+def ov_upload(path: str) -> dict:
+    """Upload a wav and get back the FileData handle the clone endpoint expects."""
+    with open(path, "rb") as f:
+        blob = f.read()
+    boundary = "----ghostprotocol" + uuid.uuid4().hex
+    name = os.path.basename(path)
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\n"
+        f"Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + blob + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(f"{OMNIVOICE_URL}/gradio_api/upload", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        paths = json.load(r)
+    if not paths:
+        raise RuntimeError(f"OmniVoice rejected the reference upload for {name}")
+    return {"path": paths[0], "orig_name": name, "mime_type": "audio/wav",
+            "size": len(blob), "is_stream": False, "meta": {"_type": "gradio.FileData"}}
+
+
+def ov_download(filedata: dict) -> bytes:
+    """Pull the rendered wav out of the OmniVoice file store."""
+    url = filedata.get("url") or f"{OMNIVOICE_URL}/gradio_api/file={filedata.get('path', '')}"
+    if url.startswith("/"):
+        url = OMNIVOICE_URL + url
+    with urllib.request.urlopen(url, timeout=180) as r:
+        return r.read()
+
+
+# The dropdowns are bilingual; the API wants the exact label. Keep the registry English.
+OV_ATTR = {
+    "gender": {"Auto": "Auto", "Male": "Male / 男", "Female": "Female / 女"},
+    "age": {"Auto": "Auto", "Child": "Child / 儿童", "Teenager": "Teenager / 少年",
+            "Young Adult": "Young Adult / 青年", "Middle-aged": "Middle-aged / 中年",
+            "Elderly": "Elderly / 老年"},
+    "pitch": {"Auto": "Auto", "Very Low": "Very Low Pitch / 极低音调", "Low": "Low Pitch / 低音调",
+              "Moderate": "Moderate Pitch / 中音调", "High": "High Pitch / 高音调",
+              "Very High": "Very High Pitch / 极高音调"},
+    "style": {"Auto": "Auto", "Whisper": "Whisper / 耳语"},
+    "accent": {"Auto": "Auto", "American": "American Accent / 美式口音",
+               "Australian": "Australian Accent / 澳大利亚口音", "British": "British Accent / 英国口音",
+               "Canadian": "Canadian Accent / 加拿大口音", "Indian": "Indian Accent / 印度口音",
+               "Korean": "Korean Accent / 韩国口音", "Russian": "Russian Accent / 俄罗斯口音",
+               "Japanese": "Japanese Accent / 日本口音", "Chinese": "Chinese Accent / 中国口音",
+               "Portuguese": "Portuguese Accent / 葡萄牙口音"},
+}
+
+
+def ov_design(text: str, spec: dict) -> bytes:
+    """Synthesise a brand-new voice from attributes alone. Returns wav bytes."""
+    d = dict(OV_DESIGN_DEFAULTS)
+    d.update({k: spec[k] for k in ("steps", "cfg", "denoise", "speed", "duration") if k in spec})
+    groups = [OV_ATTR[k].get(spec.get(k, "Auto"), "Auto") for k in ("gender", "age", "pitch", "style", "accent")]
+    groups.append("Auto")  # Chinese dialect — the show is English-only
+    data = [text, "Auto", d["steps"], d["cfg"], d["denoise"], d["speed"], d["duration"], True, True] + groups
+    out = ov_predict("_design_fn", data)
+    if not out or not out[0]:
+        raise RuntimeError(out[1] if len(out) > 1 else "OmniVoice returned no audio")
+    return ov_download(out[0])
+
+
+def ov_voiceprint_path(sid: str) -> str:
+    return os.path.join(VOICEPRINTS_DIR, f"{sid}.wav")
+
+
+def ov_speak(sid: str, text: str, speed: float = 1.0, instruct=None, steps: int = 32, cfg: float = 2.0) -> bytes:
+    """Say `text` in cast member `sid`'s designed voice, by cloning their voiceprint. Returns wav bytes."""
+    ref_path = ov_voiceprint_path(sid)
+    if not os.path.isfile(ref_path):
+        raise RuntimeError(f"no voiceprint for '{sid}' — run: python3 voice_forge.py design --sid {sid}")
+    key = (sid, os.path.getmtime(ref_path))
+    if key not in _OV_REF_CACHE:
+        _OV_REF_CACHE.clear()  # one live reference handle per sid is plenty
+        _OV_REF_CACHE[key] = ov_upload(ref_path)
+    #      [text, lang, ref, ref_text, instruct, steps, cfg, denoise, speed, duration, preproc, postproc]
+    data = [text, "Auto", _OV_REF_CACHE[key], None, instruct, steps, cfg, True, speed, None, True, True]
+    out = ov_predict("_clone_fn", data)
+    if not out or not out[0]:
+        raise RuntimeError(out[1] if len(out) > 1 else "OmniVoice returned no audio")
+    return ov_download(out[0])
+
+
+def ov_available_voiceprints() -> list:
+    """sids that currently have a designed voiceprint on disk."""
+    try:
+        # `_`-prefixed wavs are reels and scratch takes, not castable voices
+        return sorted(f[:-4] for f in os.listdir(VOICEPRINTS_DIR)
+                      if f.endswith(".wav") and not f.startswith("_"))
+    except OSError:
+        return []
 
 
 def proxy_chat(body: dict) -> dict:
@@ -150,13 +309,52 @@ def build_bg_input(dur: str, fmt: str):
     return args, None
 
 
+def synth_segment(seg: dict, wav_path: str, engine: str) -> str:
+    """Speak one line into wav_path. Returns '' on success, else an error string.
+
+    OmniVoice clones the speaker's designed voiceprint; piper reads a local .onnx.
+    A speaker with no voiceprint (or an OmniVoice hiccup) falls through to piper,
+    so a render never dies just because the voice host is down.
+    """
+    text = (seg.get("text") or "").strip()
+    if engine == "omnivoice":
+        sid = seg.get("ovoice") or seg.get("sid") or ""
+        if sid and os.path.isfile(ov_voiceprint_path(sid)):
+            try:
+                with open(wav_path, "wb") as f:
+                    f.write(ov_speak(sid, text, speed=float(seg.get("speed") or 1.0)))
+                return ""
+            except Exception as e:  # noqa: BLE001 — fall back rather than lose the render
+                print(f"  omnivoice failed for '{sid}' ({e}) — falling back to piper")
+        elif sid:
+            print(f"  no voiceprint for '{sid}' — falling back to piper")
+
+    voice = seg.get("voice") or "en_US-lessac-medium"
+    voice_path = os.path.join(VOICES_DIR, f"{voice}.onnx")
+    if not os.path.isfile(voice_path):
+        return f"voice model not found: {voice}.onnx"
+    try:
+        subprocess.run(["piper", "--model", voice_path, "--output_file", wav_path],
+                       input=text.encode("utf-8"), capture_output=True, check=True, timeout=120)
+    except FileNotFoundError:
+        return "'piper' not found on PATH (and OmniVoice could not cover this line)"
+    except subprocess.CalledProcessError as e:
+        return f"piper failed: {e.stderr.decode('utf-8', 'replace')[:300]}"
+    except subprocess.TimeoutExpired:
+        return "piper timed out"
+    return ""
+
+
 def render_episode(payload: dict) -> dict:
-    """Render a transcript to episode.mp4 server-side using piper + ffmpeg."""
+    """Render a transcript to episode.mp4 server-side: TTS (OmniVoice or piper) + ffmpeg."""
     segments = payload.get("segments") or []
     fmt = payload.get("format") or ""
+    engine = payload.get("engine") or "piper"
     if not segments:
         return {"ok": False, "error": "no segments to render"}
-    for tool in ("piper", "ffmpeg", "ffprobe"):
+    # piper is only mandatory when it's doing the talking — OmniVoice renders need ffmpeg alone.
+    required = ("ffmpeg", "ffprobe") if engine == "omnivoice" else ("piper", "ffmpeg", "ffprobe")
+    for tool in required:
         try:
             subprocess.run([tool, "-h" if tool == "piper" else "-version"],
                             capture_output=True, timeout=10)
@@ -178,12 +376,7 @@ def render_episode(payload: dict) -> dict:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
-        voice = seg.get("voice") or "en_US-lessac-medium"
         color = seg.get("hex") or "0xf8f8f2"
-        voice_path = os.path.join(VOICES_DIR, f"{voice}.onnx")
-        if not os.path.isfile(voice_path):
-            return {"ok": False, "error": f"voice model not found: {voice}.onnx (segment {idx}, {name})"}
-
         portrait_path = os.path.join(PORTRAITS_DIR, f"{seg.get('sid', '')}.png")
         has_portrait = bool(seg.get("sid")) and os.path.isfile(portrait_path)
 
@@ -192,15 +385,9 @@ def render_episode(payload: dict) -> dict:
             f.write(wrap_text(text, 48 if has_portrait else 74))
 
         wav_path = os.path.join(BUILD_DIR, f"{i}.wav")
-        try:
-            subprocess.run(
-                ["piper", "--model", voice_path, "--output_file", wav_path],
-                input=text.encode("utf-8"), capture_output=True, check=True, timeout=120,
-            )
-        except subprocess.CalledProcessError as e:
-            return {"ok": False, "error": f"piper failed on segment {idx} ({name}): {e.stderr.decode('utf-8','replace')[:500]}"}
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": f"piper timed out on segment {idx} ({name})"}
+        err = synth_segment(seg, wav_path, engine)
+        if err:
+            return {"ok": False, "error": f"segment {idx} ({name}): {err}"}
 
         try:
             dur = subprocess.run(
@@ -309,11 +496,20 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, "text/markdown; charset=utf-8", f.read().encode("utf-8"))
             else:
                 self._send(404, "text/plain", b"not found")
+        elif self.path == "/api/voices":
+            # Which designed voiceprints exist right now, so the cast panel can offer them.
+            self._send(200, "application/json", json.dumps({
+                "omnivoice": ov_available_voiceprints(),
+                "omnivoice_url": OMNIVOICE_URL,
+            }).encode("utf-8"))
         elif self.path.startswith("/assets/"):
-            rel = self.path[len("/assets/"):]
+            rel = self.path[len("/assets/"):].split("?")[0]
             fpath = os.path.abspath(os.path.join(BASE_DIR, "assets", rel))
             if fpath.startswith(os.path.join(BASE_DIR, "assets") + os.sep) and os.path.isfile(fpath):
-                ctype = "image/png" if fpath.endswith(".png") else "image/jpeg"
+                ctype = ("image/png" if fpath.endswith(".png")
+                         else "audio/wav" if fpath.endswith(".wav")
+                         else "application/json" if fpath.endswith(".json")
+                         else "image/jpeg")
                 with open(fpath, "rb") as f:
                     self._send(200, ctype, f.read())
             else:
@@ -554,6 +750,11 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
       <label>DEFAULT MODEL</label>
       <select id="model"></select>
       <button class="b" id="btnRefreshModels" style="width:100%;margin-top:6px;font-size:10px" onclick="loadModels()">↻ REFRESH MODEL LIST</button>
+      <label>TTS ENGINE (render)</label>
+      <select id="ttsEngine" onchange="onTtsEngineChange()">
+        <option value="omnivoice">OMNIVOICE — designed voiceprints, one per character</option>
+        <option value="piper">PIPER — local .onnx voices (offline fallback)</option>
+      </select>
       <label class="chk"><input type="checkbox" id="simMode"> SIMULATION MODE (no API — canned lines)</label>
       <button class="b" id="btnPing" style="width:100%;margin-top:9px" onclick="pingEndpoint()">TEST CONNECTION</button>
       <div id="pingOut" style="font-size:11px;color:var(--dim);margin-top:6px;word-break:break-all"></div>
@@ -637,6 +838,25 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 
 /* ============================================================== cast */
 const VOICES = ["en_US-lessac-medium","en_US-ryan-high","en_US-amy-medium","en_US-joe-medium","en_GB-alan-medium","en_GB-northern_english_male-medium"];
+let OVOICES = [];        // designed OmniVoice voiceprints available on the server (/api/voices)
+const ttsEngine = () => $('ttsEngine') ? $('ttsEngine').value : 'piper';
+const voiceLabel = () => ttsEngine()==='omnivoice' ? 'VOICE (omnivoice voiceprint)' : 'VOICE (piper)';
+function voiceOptionsHtml(c){
+  if (ttsEngine()==='omnivoice'){
+    const sel = c.ovoice || c.sid;
+    if (!OVOICES.length) return `<option value="">(no voiceprints — run voice_forge.py design)</option>`;
+    return OVOICES.map(v=>`<option value="${esc(v)}" ${v===sel?'selected':''}>${esc(v)}</option>`).join('');
+  }
+  return VOICES.map(v=>`<option ${v===c.voice?'selected':''}>${esc(v)}</option>`).join('');
+}
+async function loadVoiceprints(){
+  try{
+    const d = await (await fetch('/api/voices')).json();
+    OVOICES = d.omnivoice || [];
+    if (OVOICES.length) log(`voiceprints loaded: ${OVOICES.length} designed voices (${d.omnivoice_url})`);
+    else log('no OmniVoice voiceprints on disk — piper only. Run: python3 voice_forge.py design');
+  }catch(e){ log('voiceprint list unavailable: '+e.message); }
+}
 $('witnessVoice').innerHTML = VOICES.map(v=>`<option ${v===VOICES[2]?'selected':''}>${v}</option>`).join('');
 const KERNEL_SYS = `You are the CENTRAL SYSTEM KERNEL — the neutral diagnostic engine of THE GHOST PROTOCOL, an AI debate show. Analyze the full runtime transcript you are given and produce a tight, engaging wrap-up script (about 150-250 words) for a YouTube audience:
 1. LOGICAL ANOMALIES: name any logical fallacies committed, with a short direct quote each.
@@ -743,7 +963,8 @@ async function loadCharacterMeta(){
 function loadCast(){
   cast = CASTS[S.format].map(c => {
     const meta = CHAR_META[c.sid] || {};
-    return {...c, model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
+    return {...c, ovoice: c.ovoice || c.sid,
+            model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
   });
   renderCastList();
 }
@@ -761,13 +982,33 @@ function renderCastList(){
         ${archBadge}
         <label>NAME</label><input type="text" value="${esc(c.name)}" onchange="cast[${i}].name=this.value">
         <label>MODEL OVERRIDE (blank = default)</label><select class="castModelSel" data-idx="${i}" onchange="cast[${i}].model=this.value">${modelOptionsHtml(MODEL_LIST, c.model, true)}</select>
-        <label>VOICE (piper)</label>
-        <select onchange="cast[${i}].voice=this.value">${VOICES.map(v=>`<option ${v===c.voice?'selected':''}>${v}</option>`).join('')}</select>
+        <label>${voiceLabel()}</label>
+        <div class="row2">
+          <select class="castVoiceSel" data-idx="${i}" onchange="setCastVoice(${i}, this.value)">${voiceOptionsHtml(c)}</select>
+          <button class="b" style="font-size:10px" onclick="auditionVoice(${i})" title="play this voiceprint">▶</button>
+        </div>
         <label>SYSTEM PROMPT</label>
         <textarea rows="6" onchange="cast[${i}].sys=this.value">${esc(c.sys)}</textarea>
       </div>`;
     el.appendChild(d);
   });
+}
+function onTtsEngineChange(){
+  renderCastList();
+  syncWitness();
+  log('TTS engine: ' + ttsEngine().toUpperCase() +
+      (ttsEngine()==='omnivoice' && !OVOICES.length ? ' — but no voiceprints on disk yet' : ''));
+}
+function setCastVoice(i, v){
+  if (ttsEngine()==='omnivoice') cast[i].ovoice = v; else cast[i].voice = v;
+}
+function auditionVoice(i){
+  const sid = cast[i].ovoice || cast[i].sid;
+  if (ttsEngine()!=='omnivoice' || !OVOICES.includes(sid)){
+    log(`no voiceprint to audition for ${cast[i].name}${ttsEngine()!=='omnivoice' ? ' (switch TTS ENGINE to OMNIVOICE)' : ''}`);
+    return;
+  }
+  new Audio(`/assets/voices/${encodeURIComponent(sid)}.wav`).play().catch(e=>log('audition failed: '+e.message));
 }
 /* ============================================================== star witness (tribunal only) */
 function toggleWitness(){
@@ -783,11 +1024,12 @@ function syncWitness(){
   const name = $('witnessName').value.trim() || 'WITNESS';
   const bg = $('witnessBg').value.trim() || 'A witness with direct knowledge relevant to the case.';
   const voice = $('witnessVoice').value || VOICES[2];
+  const ovoice = OVOICES.includes('witness') ? 'witness' : '';
   const sys = `You are ${name}, a witness testifying in THE GHOST PROTOCOL's Grand Tribunal.
 Background: ${bg}
 Rules: answer the prosecution's and defense's questions directly and honestly in under 45 words; stay consistent with your background and any prior testimony; you may clarify but never dodge.
 Tone: candid, human, occasionally nervous under pressure.`;
-  const entry = {sid:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, model:'', sys};
+  const entry = {sid:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, ovoice, model:'', sys};
   if (idx>=0) cast[idx]=entry; else cast.push(entry);
   renderCastList();
 }
@@ -805,7 +1047,7 @@ function humans(){
   if (S.format!=='roundtable') return [];
   return $('humanNames').value.split(',').map(s=>s.trim()).filter(Boolean).slice(0,3)
     .map((n,i)=>({sid:'h'+i, name:n.toUpperCase()+' [HUMAN]', color:'var(--yellow)', hex:'0xf1fa8c',
-                  voice:'en_US-joe-medium', human:true}));
+                  voice:'en_US-joe-medium', ovoice:'host'+(i+1), human:true}));
 }
 function sp(sid){ return cast.find(c=>c.sid===sid); }
 
@@ -850,7 +1092,7 @@ function buildPlan(topic, rounds){
     P.push({sid:'pros', inst:`Deliver your CLOSING STATEMENT.`});
     P.push({sid:'def',  inst:`Deliver your CLOSING STATEMENT.`});
     P.push({sid:'kernel', inst:`Court is adjourned. Deliver the ruling.`});
-    P.push({human:{sid:'jury', name:'HUMAN JURY', color:'var(--yellow)', hex:'0xf1fa8c', voice:'en_US-joe-medium', human:true},
+    P.push({human:{sid:'jury', name:'HUMAN JURY', color:'var(--yellow)', hex:'0xf1fa8c', voice:'en_US-joe-medium', ovoice:'host1', human:true},
             inst:`The floor is yours, jury: type your one-line verdict (or SKIP).`});
   }
   else if (S.format==='triad'){
@@ -1000,7 +1242,7 @@ async function initialize(){
         setStatus('RUNNING','on');
         if (S.abort) break;
         if (line) addTurn({sid:t.human.sid, name:t.human.name, color:t.human.color, hex:t.human.hex,
-                           voice:t.human.voice, human:true, text:line, inst:t.inst});
+                           voice:t.human.voice, ovoice:t.human.ovoice, human:true, text:line, inst:t.inst});
         continue;
       }
       const spk = sp(t.sid);
@@ -1008,7 +1250,7 @@ async function initialize(){
       const text = await callLLM(spk, buildMessages(spk, t.inst));
       unthink();
       if (S.abort) break;
-      addTurn({sid:spk.sid, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice,
+      addTurn({sid:spk.sid, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice, ovoice:spk.ovoice,
                human:false, text, inst:t.inst});
     }
     sysline(S.abort ? '— RUN ABORTED —' : '— END OF EPISODE —');
@@ -1112,10 +1354,11 @@ function fold(s, w){                                        // naive word wrap
 function sanName(n){ return n.replace(/[:'\\,%]/g,'').toUpperCase(); }
 function dlCompileScript(){
   if (!S.transcript.length) return alert('No transcript yet — run an episode first.');
+  const engine = ttsEngine();
   let sh=`#!/usr/bin/env bash
 # ==========================================================================
-# THE GHOST PROTOCOL — episode compiler (100% open source: piper + ffmpeg)
-# Generated ${new Date().toISOString()} | format: ${S.format}
+# THE GHOST PROTOCOL — episode compiler (100% open source: OmniVoice/piper + ffmpeg)
+# Generated ${new Date().toISOString()} | format: ${S.format} | tts: ${engine}
 #
 # Mirrors the server-side RENDER EPISODE.MP4 pipeline: cutout portraits
 # (assets/portraits/<sid>.png, transparent) get a Ken Burns zoom + wobbling
@@ -1124,16 +1367,27 @@ function dlCompileScript(){
 #
 # Requirements (Arch):
 #   sudo pacman -S ffmpeg
-#   yay -S piper-tts-bin          # or: pip install piper-tts
-#   Download the voice models used below (*.onnx + *.onnx.json) from
-#   https://huggingface.co/rhasspy/piper-voices and put them in ./voices/
+#   TTS=omnivoice (the default here) clones each character's designed
+#   voiceprint via voice_forge.py — needs this repo and a reachable OmniVoice
+#   host, nothing installed. TTS=piper reads local .onnx models instead:
+#     yay -S piper-tts-bin        # or: pip install piper-tts
+#     Download the voices used below (*.onnx + *.onnx.json) from
+#     https://huggingface.co/rhasspy/piper-voices into ./voices/
 #   Run this from the repo root so ./assets/ resolves, or set ASSETSDIR.
+#
+# Engine:  TTS=piper bash compile_show.sh      # force the offline engine
+#          GP_OMNIVOICE=http://host:7861 …     # point at another OmniVoice
 #
 # Run:   bash compile_show.sh     ->  episode.mp4
 # ==========================================================================
 set -euo pipefail
-command -v piper  >/dev/null || { echo "piper not found";  exit 1; }
+TTS="\${TTS:-${engine}}"
 command -v ffmpeg >/dev/null || { echo "ffmpeg not found"; exit 1; }
+if [ "$TTS" = piper ]; then
+  command -v piper >/dev/null || { echo "piper not found"; exit 1; }
+else
+  [ -f voice_forge.py ] || { echo "voice_forge.py not found — run from the repo root, or use TTS=piper"; exit 1; }
+fi
 W=1920; H=1080; BG=0x0a0e14; PSIZE=640; FPS=25
 TEXTBOX="box=1:boxcolor=0x0a0e14@0.55:boxborderw=10"
 VOICEDIR="\${VOICEDIR:-voices}"
@@ -1142,10 +1396,14 @@ FORMAT="${S.format}"
 BACKDROP="$ASSETSDIR/backdrops/$FORMAT.jpg"
 mkdir -p build; rm -f build/concat.txt
 
-seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> ; reads text from build/<idx>.txt
-  local i=$1 name=$2 color=$3 voice=$4 sid=$5 tf="build/$1.txt"
+seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> <ovoice> ; reads text from build/<idx>.txt
+  local i=$1 name=$2 color=$3 voice=$4 sid=$5 ovoice=\${6:-} tf="build/$1.txt"
   echo ">> [$i] $name"
-  piper --model "$VOICEDIR/$voice.onnx" --output_file "build/$i.wav" < "$tf"
+  if [ "$TTS" != piper ] && [ -n "$ovoice" ] && [ -f "$ASSETSDIR/voices/$ovoice.wav" ]; then
+    python3 voice_forge.py speak --sid "$ovoice" --text "$(cat "$tf")" --out "build/$i.wav" >/dev/null
+  else
+    piper --model "$VOICEDIR/$voice.onnx" --output_file "build/$i.wav" < "$tf"
+  fi
   local dur; dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "build/$i.wav")
 
   local bgargs=(-f lavfi -i "color=c=$BG:s=\${W}x\${H}:d=$dur")
@@ -1181,7 +1439,7 @@ seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> ; reads text from build/<id
     const eof='GP_EOF_'+i;
     const wrapw = t.sid ? 48 : 74;
     sh += `cat > build/${i}.txt <<'${eof}'\n${fold(t.text,wrapw)}\n${eof}\n`;
-    sh += `seg ${i} '${shq(sanName(t.name))}' ${t.hex||'0xf8f8f2'} '${shq(t.voice||'en_US-lessac-medium')}' '${shq(t.sid||'')}'\n\n`;
+    sh += `seg ${i} '${shq(sanName(t.name))}' ${t.hex||'0xf8f8f2'} '${shq(t.voice||'en_US-lessac-medium')}' '${shq(t.sid||'')}' '${shq(t.ovoice||t.sid||'')}'\n\n`;
   });
   sh += `ffmpeg -y -v error -f concat -safe 0 -i build/concat.txt -c copy episode.mp4
 echo "=========================================="
@@ -1198,9 +1456,10 @@ async function renderEpisode(){
   $('renderResult').innerHTML = '';
   log('render: starting ('+S.transcript.length+' segments)…');
   try{
-    const segments = S.transcript.map(t=>({sid:t.sid, name:t.name, text:t.text, voice:t.voice||'en_US-lessac-medium', hex:t.hex||'0xf8f8f2'}));
+    const segments = S.transcript.map(t=>({sid:t.sid, name:t.name, text:t.text,
+      voice:t.voice||'en_US-lessac-medium', ovoice:t.ovoice||t.sid||'', hex:t.hex||'0xf8f8f2'}));
     const r = await fetch('/api/render',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({segments, format:S.format})});
+      body:JSON.stringify({segments, format:S.format, engine:ttsEngine()})});
     const j = await r.json();
     if (!j.ok) throw new Error(j.error);
     log('render: done -> '+j.file+' ('+j.size_mb+' MB)');
@@ -1358,6 +1617,8 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBio(); 
     log(`topic bank loaded: ${TOPICS.length} theses (${TOPICS.filter(t=>t.cat==='serious').length} serious / ${TOPICS.filter(t=>t.cat==='absurd').length} absurd)`);
   }catch(e){ log('topic bank unavailable: '+e.message); }
   await loadCharacterMeta();
+  await loadVoiceprints();
+  if (!OVOICES.length) $('ttsEngine').value = 'piper';   // nothing designed yet — don't promise what we can't do
   loadCast();
   loadModels();
   log('GHOST PROTOCOL studio online.');
