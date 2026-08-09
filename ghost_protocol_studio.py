@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -51,9 +52,340 @@ except Exception:  # noqa: BLE001 — file optional; ship a tiny fallback bank
 CHARACTERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "characters.json")
 try:
     with open(CHARACTERS_FILE, encoding="utf-8") as _f:
-        CHARACTERS = json.load(_f).get("characters", [])
+        _REG = json.load(_f)
+    CHARACTERS = _REG.get("characters", [])
+    # Human co-hosts, the jury and the star witness get voices too — they just have no soul.
+    GUEST_VOICES = _REG.get("guest_voices", [])
 except Exception:  # noqa: BLE001 — file optional; app works with plain CASTS if missing
-    CHARACTERS = []
+    CHARACTERS, GUEST_VOICES = [], []
+
+# =============================================================================
+#  SHOW DIRECTORY — hired souls
+#  A show repo (made from show-template) holds cast/<sid>/ and crew/<sid>/, each
+#  a Guild package: card.json + SOUL.md (+ MEMORY.md, this show's own continuity).
+#  Souls are prompts, memory is local, and neither ever flows back to the Guild.
+#  Resolution order, first hit wins:
+#    1. $GP_SHOW_DIR            explicit, always wins
+#    2. <engine>/show/          the dev show that ships with this repo
+#    3. <engine>/..             vendored case: show-template/studio/ -> the show
+#  No show dir (or no hires in it) => the built-in CASTS in the UI still run, so
+#  a bare engine checkout demos exactly as it always did.
+# =============================================================================
+CAST_DIRS = ("cast", "crew")
+
+
+def _is_show_dir(path: str) -> bool:
+    return any(os.path.isdir(os.path.join(path, d)) for d in CAST_DIRS)
+
+
+def resolve_show_dir() -> str:
+    env = os.environ.get("GP_SHOW_DIR", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))  # honour it even if empty — the user asked
+    for cand in (os.path.join(BASE_DIR, "show"), os.path.dirname(BASE_DIR)):
+        if _is_show_dir(cand):
+            return cand
+    return ""
+
+
+SHOW_DIR = resolve_show_dir()
+
+# SOUL.md sections, in the order they are assembled into a system prompt.
+# Identity leads bare (it is the "you are ..." line); the rest get headers.
+SOUL_SECTIONS = [
+    ("", ("identity",)),
+    ("ARCHETYPE", ("archetype",)),
+    ("ROLE", ("role",)),
+    ("CRAFT RULES", ("craft rules", "working style")),
+    ("VOICE", ("voice",)),
+    ("RELATIONSHIPS", ("relationships",)),
+    ("PRODUCES", ("produces",)),
+    ("HARD LINES — contractual, never break character to escape one", ("hard lines",)),
+    ("DIRECTOR'S STANDING NOTES", ("director's standing notes", "directors standing notes")),
+]
+MEMORY_LIMIT = 1600  # chars of continuity digest — enough for gags and grudges, not a second transcript
+
+
+def parse_soul(text: str) -> dict:
+    """SOUL.md -> {lowercased section name: body}. The `# SOUL — NAME` title is dropped."""
+    out, name, buf = {}, None, []
+    for line in text.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            if name:
+                out[name] = "\n".join(buf).strip()
+            name, buf = m.group(1).strip().lower(), []
+        elif name is not None:
+            buf.append(line)
+    if name:
+        out[name] = "\n".join(buf).strip()
+    return out
+
+
+def _drop_placeholders(body: str) -> str:
+    """Strip the `(none yet)` / `(Empty. ...)` / `(as system prompt)` stubs the templates ship with."""
+    kept = [ln for ln in body.splitlines()
+            if not re.fullmatch(r"[-*]?\s*\(.*\)\s*", ln.strip())]
+    return "\n".join(kept).strip()
+
+
+def memory_digest(text: str) -> str:
+    """MEMORY.md -> the sections that actually have content. Empty string when the character is new."""
+    parts = []
+    for section, body in parse_soul(text).items():
+        body = _drop_placeholders(body)
+        if body:
+            parts.append(f"{section.upper()}:\n{body}")
+    digest = "\n\n".join(parts)
+    return digest[:MEMORY_LIMIT].rstrip() if digest else ""
+
+
+def assemble_prompt(card: dict, soul_md: str, memory_md: str) -> str:
+    """Soul (+ this show's memory) -> the system prompt the character performs under.
+
+    A soul with nothing usable in it falls back to card.json's `system_prompt`, so a
+    minimal member package still casts."""
+    soul = parse_soul(soul_md)
+    blocks = []
+    for header, aliases in SOUL_SECTIONS:
+        body = next((soul[a] for a in aliases if a in soul), "")
+        body = _drop_placeholders(body)
+        if not body:
+            continue
+        blocks.append(f"{header}\n{body}" if header else body)
+    if not blocks:
+        return (card.get("system_prompt") or "").strip()
+    digest = memory_digest(memory_md)
+    if digest:
+        blocks.append("CONTINUITY — what you carry from previous episodes. Reference it "
+                      "when it lands naturally; never recite it.\n" + digest)
+    return "\n\n".join(blocks)
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def load_member(mdir: str, kind: str) -> dict:
+    """One hired package -> everything the cast panel and the run loop need."""
+    try:
+        card = json.loads(_read(os.path.join(mdir, "card.json")) or "{}")
+    except json.JSONDecodeError:
+        return {}
+    sid = card.get("sid") or os.path.basename(mdir)
+    memory_md = _read(os.path.join(mdir, "MEMORY.md"))
+    color = card.get("color") or "#8be9fd"
+    return {
+        "sid": sid,
+        "name": card.get("name", sid.upper()),
+        "kind": card.get("kind", kind),
+        "version": card.get("version", "?"),
+        "role": card.get("role", ""),
+        "department": card.get("department", ""),
+        "formats": card.get("formats", []),
+        "archetype": card.get("archetype", ""),
+        "humor_style": card.get("humor_style", ""),
+        "color": color,
+        "hex": "0x" + color.lstrip("#"),
+        "model_recommendation": card.get("model_recommendation", ""),
+        "piper_voice": card.get("piper_voice", ""),
+        "omnivoice": card.get("omnivoice", {}),
+        "sys": assemble_prompt(card, _read(os.path.join(mdir, "SOUL.md")), memory_md),
+        "memory": bool(memory_digest(memory_md)),
+        "hired": True,
+    }
+
+
+def scan_show(show_dir: str = None) -> dict:
+    """Rescan the show dir on every call — editing a SOUL.md must change the next run,
+    with no server restart."""
+    show_dir = SHOW_DIR if show_dir is None else show_dir
+    out = {"show": show_dir, "cast": [], "crew": [], "bible": False}
+    if not show_dir or not os.path.isdir(show_dir):
+        return out
+    out["bible"] = os.path.isfile(os.path.join(show_dir, "SERIES_BIBLE.md"))
+    for key, kind in (("cast", "actor"), ("crew", "crew")):
+        root = os.path.join(show_dir, key)
+        if not os.path.isdir(root):
+            continue
+        for sid in sorted(os.listdir(root)):
+            mdir = os.path.join(root, sid)
+            if os.path.isfile(os.path.join(mdir, "card.json")):
+                m = load_member(mdir, kind)
+                if m:
+                    out[key].append(m)
+    return out
+
+
+def show_soul_path(sid: str) -> str:
+    """Where a hired member's SOUL.md lives, or '' — path-guarded on sid."""
+    if not SHOW_DIR or not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+        return ""
+    for d in CAST_DIRS:
+        p = os.path.join(SHOW_DIR, d, sid, "SOUL.md")
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+# =============================================================================
+#  OmniVoice — designed per-character voiceprints, cloned line by line.
+#  Self-hosted Gradio app (open source, runs on madhatter). Two calls matter:
+#    _design_fn  attributes (gender/age/pitch/accent) -> a brand-new voice
+#    _clone_fn   reference wav + text                 -> that voice, saying anything
+#  voice_forge.py designs each cast member's voiceprint once into assets/voices/;
+#  the renderer clones from it so a character sounds identical in every episode.
+#  Piper stays the offline fallback — nothing here is required to render.
+# =============================================================================
+OMNIVOICE_URL = os.environ.get("GP_OMNIVOICE", "https://omnivoice.madhatter.modlin.cloud").rstrip("/")
+VOICEPRINTS_DIR = os.path.join(BASE_DIR, "assets", "voices")
+OV_DESIGN_DEFAULTS = {"steps": 32, "cfg": 2.0, "denoise": True, "speed": 1.0, "duration": None}
+_OV_FN_CACHE: dict = {}
+_OV_REF_CACHE: dict = {}
+
+
+def ov_fn_index(api_name: str) -> int:
+    """fn_index for a Gradio api_name. Gradio 6's sse_v3 protocol wants the index, not the name."""
+    if not _OV_FN_CACHE:
+        with urllib.request.urlopen(f"{OMNIVOICE_URL}/config", timeout=30) as r:
+            cfg = json.load(r)
+        for i, dep in enumerate(cfg.get("dependencies", [])):
+            if dep.get("api_name"):
+                _OV_FN_CACHE[dep["api_name"]] = i
+    if api_name not in _OV_FN_CACHE:
+        raise RuntimeError(f"OmniVoice has no endpoint '{api_name}' — is {OMNIVOICE_URL} the right host?")
+    return _OV_FN_CACHE[api_name]
+
+
+def ov_predict(api_name: str, data: list, timeout: int = 300) -> list:
+    """Run one OmniVoice job: join the queue, then read the SSE stream until it completes."""
+    session = uuid.uuid4().hex
+    body = json.dumps({"data": data, "fn_index": ov_fn_index(api_name), "session_hash": session,
+                       "trigger_id": None, "event_data": None,
+                       "batched": False, "simple_format": False}).encode("utf-8")
+    req = urllib.request.Request(f"{OMNIVOICE_URL}/gradio_api/queue/join", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        join = json.load(r)
+    if not join.get("event_id"):
+        raise RuntimeError(join.get("detail") or "OmniVoice queue join failed")
+
+    with urllib.request.urlopen(
+        f"{OMNIVOICE_URL}/gradio_api/queue/data?session_hash={session}", timeout=timeout
+    ) as stream:
+        for raw in stream:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                msg = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            kind = msg.get("msg")
+            if kind == "process_completed":
+                out = msg.get("output") or {}
+                if not msg.get("success") or out.get("error"):
+                    raise RuntimeError(out.get("error") or "OmniVoice generation failed")
+                return out.get("data") or []
+            if kind == "unexpected_error":
+                raise RuntimeError(msg.get("message") or "OmniVoice backend error")
+    raise RuntimeError("OmniVoice stream ended without completing")
+
+
+def ov_upload(path: str) -> dict:
+    """Upload a wav and get back the FileData handle the clone endpoint expects."""
+    with open(path, "rb") as f:
+        blob = f.read()
+    boundary = "----ghostprotocol" + uuid.uuid4().hex
+    name = os.path.basename(path)
+    body = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{name}\"\r\n"
+        f"Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + blob + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(f"{OMNIVOICE_URL}/gradio_api/upload", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        paths = json.load(r)
+    if not paths:
+        raise RuntimeError(f"OmniVoice rejected the reference upload for {name}")
+    return {"path": paths[0], "orig_name": name, "mime_type": "audio/wav",
+            "size": len(blob), "is_stream": False, "meta": {"_type": "gradio.FileData"}}
+
+
+def ov_download(filedata: dict) -> bytes:
+    """Pull the rendered wav out of the OmniVoice file store."""
+    url = filedata.get("url") or f"{OMNIVOICE_URL}/gradio_api/file={filedata.get('path', '')}"
+    if url.startswith("/"):
+        url = OMNIVOICE_URL + url
+    with urllib.request.urlopen(url, timeout=180) as r:
+        return r.read()
+
+
+# The dropdowns are bilingual; the API wants the exact label. Keep the registry English.
+OV_ATTR = {
+    "gender": {"Auto": "Auto", "Male": "Male / 男", "Female": "Female / 女"},
+    "age": {"Auto": "Auto", "Child": "Child / 儿童", "Teenager": "Teenager / 少年",
+            "Young Adult": "Young Adult / 青年", "Middle-aged": "Middle-aged / 中年",
+            "Elderly": "Elderly / 老年"},
+    "pitch": {"Auto": "Auto", "Very Low": "Very Low Pitch / 极低音调", "Low": "Low Pitch / 低音调",
+              "Moderate": "Moderate Pitch / 中音调", "High": "High Pitch / 高音调",
+              "Very High": "Very High Pitch / 极高音调"},
+    "style": {"Auto": "Auto", "Whisper": "Whisper / 耳语"},
+    "accent": {"Auto": "Auto", "American": "American Accent / 美式口音",
+               "Australian": "Australian Accent / 澳大利亚口音", "British": "British Accent / 英国口音",
+               "Canadian": "Canadian Accent / 加拿大口音", "Indian": "Indian Accent / 印度口音",
+               "Korean": "Korean Accent / 韩国口音", "Russian": "Russian Accent / 俄罗斯口音",
+               "Japanese": "Japanese Accent / 日本口音", "Chinese": "Chinese Accent / 中国口音",
+               "Portuguese": "Portuguese Accent / 葡萄牙口音"},
+}
+
+
+def ov_design(text: str, spec: dict) -> bytes:
+    """Synthesise a brand-new voice from attributes alone. Returns wav bytes."""
+    d = dict(OV_DESIGN_DEFAULTS)
+    d.update({k: spec[k] for k in ("steps", "cfg", "denoise", "speed", "duration") if k in spec})
+    groups = [OV_ATTR[k].get(spec.get(k, "Auto"), "Auto") for k in ("gender", "age", "pitch", "style", "accent")]
+    groups.append("Auto")  # Chinese dialect — the show is English-only
+    data = [text, "Auto", d["steps"], d["cfg"], d["denoise"], d["speed"], d["duration"], True, True] + groups
+    out = ov_predict("_design_fn", data)
+    if not out or not out[0]:
+        raise RuntimeError(out[1] if len(out) > 1 else "OmniVoice returned no audio")
+    return ov_download(out[0])
+
+
+def ov_voiceprint_path(sid: str) -> str:
+    return os.path.join(VOICEPRINTS_DIR, f"{sid}.wav")
+
+
+def ov_speak(sid: str, text: str, speed: float = 1.0, instruct=None, steps: int = 32, cfg: float = 2.0) -> bytes:
+    """Say `text` in cast member `sid`'s designed voice, by cloning their voiceprint. Returns wav bytes."""
+    ref_path = ov_voiceprint_path(sid)
+    if not os.path.isfile(ref_path):
+        raise RuntimeError(f"no voiceprint for '{sid}' — run: python3 voice_forge.py design --sid {sid}")
+    key = (sid, os.path.getmtime(ref_path))
+    if key not in _OV_REF_CACHE:
+        _OV_REF_CACHE.clear()  # one live reference handle per sid is plenty
+        _OV_REF_CACHE[key] = ov_upload(ref_path)
+    #      [text, lang, ref, ref_text, instruct, steps, cfg, denoise, speed, duration, preproc, postproc]
+    data = [text, "Auto", _OV_REF_CACHE[key], None, instruct, steps, cfg, True, speed, None, True, True]
+    out = ov_predict("_clone_fn", data)
+    if not out or not out[0]:
+        raise RuntimeError(out[1] if len(out) > 1 else "OmniVoice returned no audio")
+    return ov_download(out[0])
+
+
+def ov_available_voiceprints() -> list:
+    """sids that currently have a designed voiceprint on disk."""
+    try:
+        # `_`-prefixed wavs are reels and scratch takes, not castable voices
+        return sorted(f[:-4] for f in os.listdir(VOICEPRINTS_DIR)
+                      if f.endswith(".wav") and not f.startswith("_"))
+    except OSError:
+        return []
 
 
 def proxy_chat(body: dict) -> dict:
@@ -150,13 +482,52 @@ def build_bg_input(dur: str, fmt: str):
     return args, None
 
 
+def synth_segment(seg: dict, wav_path: str, engine: str) -> str:
+    """Speak one line into wav_path. Returns '' on success, else an error string.
+
+    OmniVoice clones the speaker's designed voiceprint; piper reads a local .onnx.
+    A speaker with no voiceprint (or an OmniVoice hiccup) falls through to piper,
+    so a render never dies just because the voice host is down.
+    """
+    text = (seg.get("text") or "").strip()
+    if engine == "omnivoice":
+        sid = seg.get("ovoice") or seg.get("sid") or ""
+        if sid and os.path.isfile(ov_voiceprint_path(sid)):
+            try:
+                with open(wav_path, "wb") as f:
+                    f.write(ov_speak(sid, text, speed=float(seg.get("speed") or 1.0)))
+                return ""
+            except Exception as e:  # noqa: BLE001 — fall back rather than lose the render
+                print(f"  omnivoice failed for '{sid}' ({e}) — falling back to piper")
+        elif sid:
+            print(f"  no voiceprint for '{sid}' — falling back to piper")
+
+    voice = seg.get("voice") or "en_US-lessac-medium"
+    voice_path = os.path.join(VOICES_DIR, f"{voice}.onnx")
+    if not os.path.isfile(voice_path):
+        return f"voice model not found: {voice}.onnx"
+    try:
+        subprocess.run(["piper", "--model", voice_path, "--output_file", wav_path],
+                       input=text.encode("utf-8"), capture_output=True, check=True, timeout=120)
+    except FileNotFoundError:
+        return "'piper' not found on PATH (and OmniVoice could not cover this line)"
+    except subprocess.CalledProcessError as e:
+        return f"piper failed: {e.stderr.decode('utf-8', 'replace')[:300]}"
+    except subprocess.TimeoutExpired:
+        return "piper timed out"
+    return ""
+
+
 def render_episode(payload: dict) -> dict:
-    """Render a transcript to episode.mp4 server-side using piper + ffmpeg."""
+    """Render a transcript to episode.mp4 server-side: TTS (OmniVoice or piper) + ffmpeg."""
     segments = payload.get("segments") or []
     fmt = payload.get("format") or ""
+    engine = payload.get("engine") or "piper"
     if not segments:
         return {"ok": False, "error": "no segments to render"}
-    for tool in ("piper", "ffmpeg", "ffprobe"):
+    # piper is only mandatory when it's doing the talking — OmniVoice renders need ffmpeg alone.
+    required = ("ffmpeg", "ffprobe") if engine == "omnivoice" else ("piper", "ffmpeg", "ffprobe")
+    for tool in required:
         try:
             subprocess.run([tool, "-h" if tool == "piper" else "-version"],
                             capture_output=True, timeout=10)
@@ -178,12 +549,7 @@ def render_episode(payload: dict) -> dict:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
-        voice = seg.get("voice") or "en_US-lessac-medium"
         color = seg.get("hex") or "0xf8f8f2"
-        voice_path = os.path.join(VOICES_DIR, f"{voice}.onnx")
-        if not os.path.isfile(voice_path):
-            return {"ok": False, "error": f"voice model not found: {voice}.onnx (segment {idx}, {name})"}
-
         portrait_path = os.path.join(PORTRAITS_DIR, f"{seg.get('sid', '')}.png")
         has_portrait = bool(seg.get("sid")) and os.path.isfile(portrait_path)
 
@@ -192,15 +558,9 @@ def render_episode(payload: dict) -> dict:
             f.write(wrap_text(text, 48 if has_portrait else 74))
 
         wav_path = os.path.join(BUILD_DIR, f"{i}.wav")
-        try:
-            subprocess.run(
-                ["piper", "--model", voice_path, "--output_file", wav_path],
-                input=text.encode("utf-8"), capture_output=True, check=True, timeout=120,
-            )
-        except subprocess.CalledProcessError as e:
-            return {"ok": False, "error": f"piper failed on segment {idx} ({name}): {e.stderr.decode('utf-8','replace')[:500]}"}
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": f"piper timed out on segment {idx} ({name})"}
+        err = synth_segment(seg, wav_path, engine)
+        if err:
+            return {"ok": False, "error": f"segment {idx} ({name}): {err}"}
 
         try:
             dur = subprocess.run(
@@ -301,19 +661,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(TOPICS).encode("utf-8"))
         elif self.path == "/api/characters":
             self._send(200, "application/json", json.dumps(CHARACTERS).encode("utf-8"))
+        elif self.path == "/api/cast":
+            # Rescanned per request: edit a SOUL.md, reload the panel, the next run uses it.
+            self._send(200, "application/json", json.dumps(scan_show()).encode("utf-8"))
         elif self.path.startswith("/api/characters/") and self.path.endswith("/bio"):
             sid = self.path[len("/api/characters/"):-len("/bio")]
-            fpath = os.path.abspath(os.path.join(BASE_DIR, "characters", f"{sid}.md"))
+            # A hired soul is this show's version of the character — it wins over the built-in bio.
+            fpath = show_soul_path(sid) or os.path.abspath(os.path.join(BASE_DIR, "characters", f"{sid}.md"))
             if re.fullmatch(r"[a-zA-Z0-9_-]+", sid) and os.path.isfile(fpath):
                 with open(fpath, encoding="utf-8") as f:
                     self._send(200, "text/markdown; charset=utf-8", f.read().encode("utf-8"))
             else:
                 self._send(404, "text/plain", b"not found")
+        elif self.path == "/api/voices":
+            # Which designed voiceprints exist right now, so the cast panel can offer them.
+            self._send(200, "application/json", json.dumps({
+                "omnivoice": ov_available_voiceprints(),
+                "omnivoice_url": OMNIVOICE_URL,
+            }).encode("utf-8"))
         elif self.path.startswith("/assets/"):
-            rel = self.path[len("/assets/"):]
+            rel = self.path[len("/assets/"):].split("?")[0]
             fpath = os.path.abspath(os.path.join(BASE_DIR, "assets", rel))
             if fpath.startswith(os.path.join(BASE_DIR, "assets") + os.sep) and os.path.isfile(fpath):
-                ctype = "image/png" if fpath.endswith(".png") else "image/jpeg"
+                ctype = ("image/png" if fpath.endswith(".png")
+                         else "audio/wav" if fpath.endswith(".wav")
+                         else "application/json" if fpath.endswith(".json")
+                         else "image/jpeg")
                 with open(fpath, "rb") as f:
                     self._send(200, ctype, f.read())
             else:
@@ -544,6 +917,8 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
     <div class="sec">
       <h2>02 // CAST</h2>
       <div id="castList"></div>
+      <button class="b" style="width:100%;margin-top:8px;font-size:10px" onclick="reloadSouls()"
+              title="re-read the show dir — picks up SOUL.md and MEMORY.md edits">↻ RELOAD SOULS</button>
     </div>
     <div class="sec">
       <h2>03 // ENGINE</h2>
@@ -554,6 +929,11 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
       <label>DEFAULT MODEL</label>
       <select id="model"></select>
       <button class="b" id="btnRefreshModels" style="width:100%;margin-top:6px;font-size:10px" onclick="loadModels()">↻ REFRESH MODEL LIST</button>
+      <label>TTS ENGINE (render)</label>
+      <select id="ttsEngine" onchange="onTtsEngineChange()">
+        <option value="omnivoice">OMNIVOICE — designed voiceprints, one per character</option>
+        <option value="piper">PIPER — local .onnx voices (offline fallback)</option>
+      </select>
       <label class="chk"><input type="checkbox" id="simMode"> SIMULATION MODE (no API — canned lines)</label>
       <button class="b" id="btnPing" style="width:100%;margin-top:9px" onclick="pingEndpoint()">TEST CONNECTION</button>
       <div id="pingOut" style="font-size:11px;color:var(--dim);margin-top:6px;word-break:break-all"></div>
@@ -630,6 +1010,7 @@ const S = {
   plan:[], planIdx:0,
   humanResolver:null,
   format:'socratic',
+  casting:{},              // format -> {slotId: hired sid} — who sits in which chair
 };
 const $ = id => document.getElementById(id);
 const log = m => { const l=$('log'); l.textContent += m+"\n"; l.scrollTop=l.scrollHeight; };
@@ -637,6 +1018,25 @@ const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;
 
 /* ============================================================== cast */
 const VOICES = ["en_US-lessac-medium","en_US-ryan-high","en_US-amy-medium","en_US-joe-medium","en_GB-alan-medium","en_GB-northern_english_male-medium"];
+let OVOICES = [];        // designed OmniVoice voiceprints available on the server (/api/voices)
+const ttsEngine = () => $('ttsEngine') ? $('ttsEngine').value : 'piper';
+const voiceLabel = () => ttsEngine()==='omnivoice' ? 'VOICE (omnivoice voiceprint)' : 'VOICE (piper)';
+function voiceOptionsHtml(c){
+  if (ttsEngine()==='omnivoice'){
+    const sel = c.ovoice || c.sid;
+    if (!OVOICES.length) return `<option value="">(no voiceprints — run voice_forge.py design)</option>`;
+    return OVOICES.map(v=>`<option value="${esc(v)}" ${v===sel?'selected':''}>${esc(v)}</option>`).join('');
+  }
+  return VOICES.map(v=>`<option ${v===c.voice?'selected':''}>${esc(v)}</option>`).join('');
+}
+async function loadVoiceprints(){
+  try{
+    const d = await (await fetch('/api/voices')).json();
+    OVOICES = d.omnivoice || [];
+    if (OVOICES.length) log(`voiceprints loaded: ${OVOICES.length} designed voices (${d.omnivoice_url})`);
+    else log('no OmniVoice voiceprints on disk — piper only. Run: python3 voice_forge.py design');
+  }catch(e){ log('voiceprint list unavailable: '+e.message); }
+}
 $('witnessVoice').innerHTML = VOICES.map(v=>`<option ${v===VOICES[2]?'selected':''}>${v}</option>`).join('');
 const KERNEL_SYS = `You are the CENTRAL SYSTEM KERNEL — the neutral diagnostic engine of THE GHOST PROTOCOL, an AI debate show. Analyze the full runtime transcript you are given and produce a tight, engaging wrap-up script (about 150-250 words) for a YouTube audience:
 1. LOGICAL ANOMALIES: name any logical fallacies committed, with a short direct quote each.
@@ -705,6 +1105,86 @@ Lens: outcomes, aggregate wellbeing, cost-benefit, measurable consequences. Argu
   sys:`You are SYNTHESIS_CORE, the merging engine of THE GHOST PROTOCOL's Triad Synthesis. Read the full three-way debate transcript and forge the hybrid position: what each school got right, where they are irreconcilable, and the single strongest compromise stance a reasonable mind could hold. End by telling viewers to vote for the school that won them over. 150-220 words.`},
 ],
 };
+/* ============================================================== hired souls (GP_SHOW_DIR)
+   Each format is a set of SLOTS. A hired member qualifies for a slot when their
+   card.json lists the format and their role matches. Slot ids are the built-in sids,
+   so the plan builders below never learn about hiring — they still ask for 'alpha'
+   and get whoever was cast in the interrogator's chair. Unfilled slots fall back to
+   the built-in CASTS entry, so a partial cast still runs. */
+const FORMAT_SLOTS = {
+socratic: [
+ {id:'alpha',  label:'INTERROGATOR', roles:['interrogator']},
+ {id:'beta',   label:'DEFENDER',     roles:['defender']},
+ {id:'kernel', label:'ADJUDICATOR',  roles:['judge','adjudicator']},
+],
+roundtable: [
+ {id:'p7',     label:'PANEL SEAT 1', roles:['panelist']},
+ {id:'mira',   label:'PANEL SEAT 2', roles:['panelist']},
+ {id:'cynic',  label:'PANEL SEAT 3', roles:['panelist']},
+ {id:'kernel', label:'ADJUDICATOR',  roles:['judge','adjudicator']},
+],
+tribunal: [
+ {id:'pros',   label:'PROSECUTION',  roles:['prosecutor','prosecution']},
+ {id:'def',    label:'DEFENSE',      roles:['defense counsel','defense','defence']},
+ {id:'acc',    label:'ACCUSED',      roles:['accused','subject']},
+ {id:'kernel', label:'JUDGE',        roles:['judge','adjudicator']},
+],
+triad: [
+ {id:'stoic',  label:'PHILOSOPHER 1', roles:['philosopher']},
+ {id:'nihil',  label:'PHILOSOPHER 2', roles:['philosopher']},
+ {id:'util',   label:'PHILOSOPHER 3', roles:['philosopher']},
+ {id:'synth',  label:'SYNTHESIZER',   roles:['synthesizer']},
+],
+};
+let HIRED = {show:'', cast:[], crew:[]};   // from /api/cast
+const hiredCast = () => HIRED.cast || [];
+/* "judge / closer" -> ["judge","closer"] */
+const roleTokens = r => (r||'').toLowerCase().split(/[\/,]/).map(s=>s.trim()).filter(Boolean);
+function qualifies(m, fmt, slot){
+  return (m.formats||[]).includes(fmt) && roleTokens(m.role).some(t=>slot.roles.includes(t));
+}
+function slotsFor(fmt){
+  return (FORMAT_SLOTS[fmt]||[]).map(s=>({...s, pool: hiredCast().filter(m=>qualifies(m, fmt, s))}));
+}
+/* Default casting: fill each slot, preferring the member whose sid IS the slot id
+   (the charter cast lands in its own chairs), then anyone else not already cast. */
+function autoCast(fmt){
+  const chosen = {}, taken = new Set();
+  const slots = slotsFor(fmt);
+  slots.forEach(s => { if (s.pool.some(m=>m.sid===s.id)){ chosen[s.id]=s.id; taken.add(s.id); } });
+  slots.forEach(s => {
+    if (chosen[s.id]) return;
+    const m = s.pool.find(m=>!taken.has(m.sid));
+    if (m){ chosen[s.id]=m.sid; taken.add(m.sid); }
+  });
+  return chosen;
+}
+function hiredToEntry(m, slotId, builtin){
+  // Voice: the card's piper voice if we have one, else keep whatever the slot's built-in used.
+  return {sid:m.sid, slot:slotId, name:m.name, color:m.color, hex:m.hex,
+          voice:m.piper_voice || (builtin && builtin.voice) || VOICES[0],
+          ovoice:m.sid, model:m.model_recommendation||'', sys:m.sys,
+          archetype:m.archetype||'', humor:m.humor_style||'', image:'',
+          hired:true, version:m.version, memory:m.memory};
+}
+async function loadHiredCast(){
+  try{
+    const d = await (await fetch('/api/cast')).json();
+    HIRED = d;
+    const n = hiredCast().length;
+    if (n) log(`show dir: ${d.show} — ${n} actor${n===1?'':'s'} + ${(d.crew||[]).length} crew on contract`);
+    else log('no hired cast found — running the built-in CASTS (set GP_SHOW_DIR to a show repo)');
+  }catch(e){ log('hired cast unavailable: '+e.message); }
+}
+
+async function reloadSouls(){
+  if (S.running) return alert('Abort the run first.');
+  await loadHiredCast();
+  loadCast();
+  syncWitness();
+  log('souls reloaded from disk');
+}
+
 let cast = [];           // live, editable copy for current format
 let MODEL_LIST = [];     // populated from /api/models
 
@@ -740,34 +1220,92 @@ async function loadCharacterMeta(){
     log(`character registry loaded: ${list.length} profiles`);
   }catch(e){ log('character registry unavailable: '+e.message); }
 }
+function builtinEntry(c){
+  const meta = CHAR_META[c.sid] || {};
+  return {...c, slot: c.sid, ovoice: c.ovoice || c.sid, hired:false,
+          model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
+}
 function loadCast(){
-  cast = CASTS[S.format].map(c => {
-    const meta = CHAR_META[c.sid] || {};
-    return {...c, model: meta.aiModel || '', archetype: meta.archetype || '', humor: meta.humor_style || '', image: meta.image || ''};
-  });
+  const builtin = {}; CASTS[S.format].forEach(c => builtin[c.sid] = c);
+  if (!hiredCast().length){
+    cast = CASTS[S.format].map(builtinEntry);        // no show dir: exactly as it always was
+  } else {
+    if (!S.casting[S.format]) S.casting[S.format] = autoCast(S.format);
+    const chosen = S.casting[S.format];
+    const bySid = {}; hiredCast().forEach(m => bySid[m.sid] = m);
+    cast = slotsFor(S.format).map(s => {
+      const m = bySid[chosen[s.id]];
+      // An unfilled slot keeps its built-in performer — a half-hired show still runs.
+      return m ? hiredToEntry(m, s.id, builtin[s.id])
+               : (builtin[s.id] ? builtinEntry(builtin[s.id]) : null);
+    }).filter(Boolean);
+  }
   renderCastList();
 }
+function recast(slotId, sid){
+  S.casting[S.format] = S.casting[S.format] || {};
+  S.casting[S.format][slotId] = sid;
+  loadCast();
+  const m = hiredCast().find(m=>m.sid===sid);
+  log(`recast ${slotId.toUpperCase()} -> ${m ? m.name : '(built-in)'}`);
+}
+function castingHtml(){
+  if (!hiredCast().length) return '';
+  const chosen = S.casting[S.format] || {};
+  const rows = slotsFor(S.format).map(s=>{
+    const opts = [`<option value="">(built-in)</option>`].concat(
+      s.pool.map(m=>`<option value="${esc(m.sid)}" ${chosen[s.id]===m.sid?'selected':''}>${esc(m.name)}</option>`)).join('');
+    const note = s.pool.length ? '' : ' <span style="color:var(--dim)">no hire qualifies</span>';
+    return `<div class="row2" style="margin-bottom:6px">
+      <label style="margin:0;align-self:center">${esc(s.label)}${note}</label>
+      <select onchange="recast('${s.id}', this.value)" ${s.pool.length?'':'disabled'}>${opts}</select></div>`;
+  }).join('');
+  return `<div style="border:1px solid var(--line);padding:10px;margin-bottom:12px">
+    <div style="font-size:10px;letter-spacing:1px;color:var(--dim);margin-bottom:8px">
+      // CASTING — ${hiredCast().length} on contract from ${esc(HIRED.show||'the show dir')}</div>${rows}</div>`;
+}
 function renderCastList(){
-  const el = $('castList'); el.innerHTML='';
+  const el = $('castList'); el.innerHTML = castingHtml();
   cast.forEach((c,i)=>{
     const d=document.createElement('div'); d.className='cast';
     const thumb = c.image ? `<img src="/${c.image}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;object-position:top;border:1px solid ${c.color}">` : `<span class="dot" style="background:${c.color}"></span>`;
+    const hiredBadge = c.hired ? `<span style="font-size:9px;color:var(--dim);letter-spacing:1px">HIRED v${esc(c.version||'?')}${c.memory?' · MEMORY':''}</span>` : '';
     const archBadge = c.archetype ? `<div style="font-size:10px;color:${c.color};letter-spacing:1px;margin:-4px 0 8px">${esc(c.archetype).toUpperCase()}${c.humor?' · '+esc(c.humor):''} <span style="text-decoration:underline;cursor:pointer;color:var(--dim)" onclick="openBio('${c.sid}')">view soul ›</span></div>` : '';
     d.innerHTML = `
       <div class="head" onclick="this.parentNode.classList.toggle('open')">
-        ${thumb}<b style="color:${c.color}">${esc(c.name)}</b><span class="car">▾</span>
+        ${thumb}<b style="color:${c.color}">${esc(c.name)}</b>${hiredBadge}<span class="car">▾</span>
       </div>
       <div class="body">
         ${archBadge}
         <label>NAME</label><input type="text" value="${esc(c.name)}" onchange="cast[${i}].name=this.value">
         <label>MODEL OVERRIDE (blank = default)</label><select class="castModelSel" data-idx="${i}" onchange="cast[${i}].model=this.value">${modelOptionsHtml(MODEL_LIST, c.model, true)}</select>
-        <label>VOICE (piper)</label>
-        <select onchange="cast[${i}].voice=this.value">${VOICES.map(v=>`<option ${v===c.voice?'selected':''}>${v}</option>`).join('')}</select>
+        <label>${voiceLabel()}</label>
+        <div class="row2">
+          <select class="castVoiceSel" data-idx="${i}" onchange="setCastVoice(${i}, this.value)">${voiceOptionsHtml(c)}</select>
+          <button class="b" style="font-size:10px" onclick="auditionVoice(${i})" title="play this voiceprint">▶</button>
+        </div>
         <label>SYSTEM PROMPT</label>
         <textarea rows="6" onchange="cast[${i}].sys=this.value">${esc(c.sys)}</textarea>
       </div>`;
     el.appendChild(d);
   });
+}
+function onTtsEngineChange(){
+  renderCastList();
+  syncWitness();
+  log('TTS engine: ' + ttsEngine().toUpperCase() +
+      (ttsEngine()==='omnivoice' && !OVOICES.length ? ' — but no voiceprints on disk yet' : ''));
+}
+function setCastVoice(i, v){
+  if (ttsEngine()==='omnivoice') cast[i].ovoice = v; else cast[i].voice = v;
+}
+function auditionVoice(i){
+  const sid = cast[i].ovoice || cast[i].sid;
+  if (ttsEngine()!=='omnivoice' || !OVOICES.includes(sid)){
+    log(`no voiceprint to audition for ${cast[i].name}${ttsEngine()!=='omnivoice' ? ' (switch TTS ENGINE to OMNIVOICE)' : ''}`);
+    return;
+  }
+  new Audio(`/assets/voices/${encodeURIComponent(sid)}.wav`).play().catch(e=>log('audition failed: '+e.message));
 }
 /* ============================================================== star witness (tribunal only) */
 function toggleWitness(){
@@ -783,11 +1321,12 @@ function syncWitness(){
   const name = $('witnessName').value.trim() || 'WITNESS';
   const bg = $('witnessBg').value.trim() || 'A witness with direct knowledge relevant to the case.';
   const voice = $('witnessVoice').value || VOICES[2];
+  const ovoice = OVOICES.includes('witness') ? 'witness' : '';
   const sys = `You are ${name}, a witness testifying in THE GHOST PROTOCOL's Grand Tribunal.
 Background: ${bg}
 Rules: answer the prosecution's and defense's questions directly and honestly in under 45 words; stay consistent with your background and any prior testimony; you may clarify but never dodge.
 Tone: candid, human, occasionally nervous under pressure.`;
-  const entry = {sid:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, model:'', sys};
+  const entry = {sid:'witness', slot:'witness', name, color:'var(--orange)', hex:'0xffb86c', voice, ovoice, model:'', sys};
   if (idx>=0) cast[idx]=entry; else cast.push(entry);
   renderCastList();
 }
@@ -805,9 +1344,10 @@ function humans(){
   if (S.format!=='roundtable') return [];
   return $('humanNames').value.split(',').map(s=>s.trim()).filter(Boolean).slice(0,3)
     .map((n,i)=>({sid:'h'+i, name:n.toUpperCase()+' [HUMAN]', color:'var(--yellow)', hex:'0xf1fa8c',
-                  voice:'en_US-joe-medium', human:true}));
+                  voice:'en_US-joe-medium', ovoice:'host'+(i+1), human:true}));
 }
-function sp(sid){ return cast.find(c=>c.sid===sid); }
+/* Plans address chairs (slot ids), not people. Whoever was cast in that chair answers. */
+function sp(id){ return cast.find(c=>c.slot===id) || cast.find(c=>c.sid===id); }
 
 function buildPlan(topic, rounds){
   const P=[];
@@ -821,12 +1361,12 @@ function buildPlan(topic, rounds){
   }
   else if (S.format==='roundtable'){
     const hs = humans();
-    const ais = cast.filter(c=>c.sid!=='kernel');
-    P.push({sid:ais[0].sid, inst:`Open the round table on: "${topic}". Give your take in your persona, and welcome the panel.`});
+    const ais = cast.filter(c=>c.slot!=='kernel');   // by chair — the adjudicator's seat sits out the panel
+    P.push({sid:ais[0].slot, inst:`Open the round table on: "${topic}". Give your take in your persona, and welcome the panel.`});
     for(let r=1;r<=rounds;r++){
       ais.forEach((a,ix)=>{
         if (r===1 && ix===0) return;
-        P.push({sid:a.sid, inst:`React to the discussion so far and push it forward. (round ${r}/${rounds})`});
+        P.push({sid:a.slot, inst:`React to the discussion so far and push it forward. (round ${r}/${rounds})`});
       });
       hs.forEach(h=> P.push({human:h, inst:`Round ${r}: jump in — a joke, a jab, a curveball question. The AIs will riff on whatever you say.`}));
     }
@@ -850,7 +1390,7 @@ function buildPlan(topic, rounds){
     P.push({sid:'pros', inst:`Deliver your CLOSING STATEMENT.`});
     P.push({sid:'def',  inst:`Deliver your CLOSING STATEMENT.`});
     P.push({sid:'kernel', inst:`Court is adjourned. Deliver the ruling.`});
-    P.push({human:{sid:'jury', name:'HUMAN JURY', color:'var(--yellow)', hex:'0xf1fa8c', voice:'en_US-joe-medium', human:true},
+    P.push({human:{sid:'jury', name:'HUMAN JURY', color:'var(--yellow)', hex:'0xf1fa8c', voice:'en_US-joe-medium', ovoice:'host1', human:true},
             inst:`The floor is yours, jury: type your one-line verdict (or SKIP).`});
   }
   else if (S.format==='triad'){
@@ -939,20 +1479,21 @@ const SIM = {
  u:["Grant rights where doing so maximizes aggregate wellbeing. If recognition costs little and prevents suffering, the ledger says yes.","Quantify it: expected harms of exclusion exceed costs of inclusion by any reasonable weighting."],
 };
 let simIdx=0;
+/* Which canned bank a speaker draws from. A hire brings their archetype to the chair,
+   so a recast panel still sounds like the people in it; otherwise the chair decides. */
+const SIM_BY_ARCHETYPE = {interrogator:'q', "devil's advocate":'q', logician:'a', pragmatist:'a', diplomat:'a',
+  skeptic:'c', idealist:'o', literalist:'l', stoic:'s', nihilist:'n', utilitarian:'u',
+  adjudicator:'k', synthesizer:'k'};
+const SIM_BY_SLOT = {alpha:'q', pros:'q', beta:'a', acc:'a', def:'a', cynic:'c', mira:'o', p7:'l',
+  stoic:'s', nihil:'n', util:'u'};
+function simBank(spk){
+  const a = (spk.archetype||'').toLowerCase().trim();
+  return SIM_BY_ARCHETYPE[a] || SIM_BY_SLOT[spk.slot || spk.sid] || 'k';
+}
 function simLine(spk){
   simIdx++;
-  const pick=a=>a[simIdx%a.length];
-  return new Promise(res=>setTimeout(()=>{
-    if (spk.sid==='alpha'||spk.sid==='pros') res(pick(SIM.q));
-    else if (spk.sid==='beta'||spk.sid==='acc'||spk.sid==='def') res(pick(SIM.a));
-    else if (spk.sid==='cynic') res(pick(SIM.c));
-    else if (spk.sid==='mira') res(pick(SIM.o));
-    else if (spk.sid==='p7') res(pick(SIM.l));
-    else if (spk.sid==='stoic') res(pick(SIM.s));
-    else if (spk.sid==='nihil') res(pick(SIM.n));
-    else if (spk.sid==='util') res(pick(SIM.u));
-    else res(SIM.k[0]);
-  }, 450));
+  const bank = SIM[simBank(spk)];
+  return new Promise(res=>setTimeout(()=>res(bank[simIdx % bank.length]), 450));
 }
 
 async function waitIfPaused(){
@@ -1000,7 +1541,7 @@ async function initialize(){
         setStatus('RUNNING','on');
         if (S.abort) break;
         if (line) addTurn({sid:t.human.sid, name:t.human.name, color:t.human.color, hex:t.human.hex,
-                           voice:t.human.voice, human:true, text:line, inst:t.inst});
+                           voice:t.human.voice, ovoice:t.human.ovoice, human:true, text:line, inst:t.inst});
         continue;
       }
       const spk = sp(t.sid);
@@ -1008,8 +1549,8 @@ async function initialize(){
       const text = await callLLM(spk, buildMessages(spk, t.inst));
       unthink();
       if (S.abort) break;
-      addTurn({sid:spk.sid, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice,
-               human:false, text, inst:t.inst});
+      addTurn({sid:spk.sid, slot:spk.slot, name:spk.name, color:spk.color, hex:spk.hex, voice:spk.voice,
+               ovoice:spk.ovoice, human:false, text, inst:t.inst});
     }
     sysline(S.abort ? '— RUN ABORTED —' : '— END OF EPISODE —');
     setStatus(S.abort?'ABORTED':'DONE', S.abort?'err':'on');
@@ -1036,7 +1577,7 @@ function clearFeed(){
 async function reroll(idx){
   if (S.running) return alert('Wait for the run to finish (or abort) before re-rolling.');
   const t=S.transcript[idx];
-  const spk=sp(t.sid); if(!spk) return;
+  const spk=sp(t.slot||t.sid); if(!spk) return;
   thinking(spk.name,spk.color);
   try{
     const text = await callLLM(spk, buildMessages(spk, t.inst||'Rewrite your last line, better.', idx));
@@ -1087,11 +1628,12 @@ function dl(name, text, mime){
 function dlTranscript(kind){
   if (!S.transcript.length) return alert('No transcript yet.');
   if (kind==='json'){
-    const castInfo = sid => { const c = sp(sid); return c ? {model:c.model||'(default)', archetype:c.archetype||'', humor_style:c.humor||'', voice:c.voice} : {}; };
+    const castInfo = id => { const c = sp(id); return c ? {model:c.model||'(default)', archetype:c.archetype||'', humor_style:c.humor||'', voice:c.voice} : {}; };
     dl('transcript.json', JSON.stringify({show:'THE GHOST PROTOCOL',format:S.format,
-      topic:$('topic').value.trim(), date:new Date().toISOString(),
-      cast: cast.map(c=>({sid:c.sid, name:c.name, archetype:c.archetype||'', humor_style:c.humor||'', model:c.model||'(default)', voice:c.voice, image:c.image||''})),
-      transcript:S.transcript.map(t=>({speaker:t.name, sid:t.sid, human:!!t.human, voice:t.voice, text:t.text, ...castInfo(t.sid)}))},null,2),
+      topic:$('topic').value.trim(), date:new Date().toISOString(), show_dir:HIRED.show||'',
+      cast: cast.map(c=>({sid:c.sid, slot:c.slot, name:c.name, archetype:c.archetype||'', humor_style:c.humor||'', model:c.model||'(default)', voice:c.voice, image:c.image||'',
+                          hired:!!c.hired, version:c.version||''})),
+      transcript:S.transcript.map(t=>({speaker:t.name, sid:t.sid, slot:t.slot||t.sid, human:!!t.human, voice:t.voice, text:t.text, ...castInfo(t.slot||t.sid)}))},null,2),
       'application/json');
   } else {
     dl('transcript.txt', S.transcript.map(t=>`${t.name}:\n${t.text}\n`).join('\n'));
@@ -1112,10 +1654,11 @@ function fold(s, w){                                        // naive word wrap
 function sanName(n){ return n.replace(/[:'\\,%]/g,'').toUpperCase(); }
 function dlCompileScript(){
   if (!S.transcript.length) return alert('No transcript yet — run an episode first.');
+  const engine = ttsEngine();
   let sh=`#!/usr/bin/env bash
 # ==========================================================================
-# THE GHOST PROTOCOL — episode compiler (100% open source: piper + ffmpeg)
-# Generated ${new Date().toISOString()} | format: ${S.format}
+# THE GHOST PROTOCOL — episode compiler (100% open source: OmniVoice/piper + ffmpeg)
+# Generated ${new Date().toISOString()} | format: ${S.format} | tts: ${engine}
 #
 # Mirrors the server-side RENDER EPISODE.MP4 pipeline: cutout portraits
 # (assets/portraits/<sid>.png, transparent) get a Ken Burns zoom + wobbling
@@ -1124,16 +1667,27 @@ function dlCompileScript(){
 #
 # Requirements (Arch):
 #   sudo pacman -S ffmpeg
-#   yay -S piper-tts-bin          # or: pip install piper-tts
-#   Download the voice models used below (*.onnx + *.onnx.json) from
-#   https://huggingface.co/rhasspy/piper-voices and put them in ./voices/
+#   TTS=omnivoice (the default here) clones each character's designed
+#   voiceprint via voice_forge.py — needs this repo and a reachable OmniVoice
+#   host, nothing installed. TTS=piper reads local .onnx models instead:
+#     yay -S piper-tts-bin        # or: pip install piper-tts
+#     Download the voices used below (*.onnx + *.onnx.json) from
+#     https://huggingface.co/rhasspy/piper-voices into ./voices/
 #   Run this from the repo root so ./assets/ resolves, or set ASSETSDIR.
+#
+# Engine:  TTS=piper bash compile_show.sh      # force the offline engine
+#          GP_OMNIVOICE=http://host:7861 …     # point at another OmniVoice
 #
 # Run:   bash compile_show.sh     ->  episode.mp4
 # ==========================================================================
 set -euo pipefail
-command -v piper  >/dev/null || { echo "piper not found";  exit 1; }
+TTS="\${TTS:-${engine}}"
 command -v ffmpeg >/dev/null || { echo "ffmpeg not found"; exit 1; }
+if [ "$TTS" = piper ]; then
+  command -v piper >/dev/null || { echo "piper not found"; exit 1; }
+else
+  [ -f voice_forge.py ] || { echo "voice_forge.py not found — run from the repo root, or use TTS=piper"; exit 1; }
+fi
 W=1920; H=1080; BG=0x0a0e14; PSIZE=640; FPS=25
 TEXTBOX="box=1:boxcolor=0x0a0e14@0.55:boxborderw=10"
 VOICEDIR="\${VOICEDIR:-voices}"
@@ -1142,10 +1696,14 @@ FORMAT="${S.format}"
 BACKDROP="$ASSETSDIR/backdrops/$FORMAT.jpg"
 mkdir -p build; rm -f build/concat.txt
 
-seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> ; reads text from build/<idx>.txt
-  local i=$1 name=$2 color=$3 voice=$4 sid=$5 tf="build/$1.txt"
+seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> <ovoice> ; reads text from build/<idx>.txt
+  local i=$1 name=$2 color=$3 voice=$4 sid=$5 ovoice=\${6:-} tf="build/$1.txt"
   echo ">> [$i] $name"
-  piper --model "$VOICEDIR/$voice.onnx" --output_file "build/$i.wav" < "$tf"
+  if [ "$TTS" != piper ] && [ -n "$ovoice" ] && [ -f "$ASSETSDIR/voices/$ovoice.wav" ]; then
+    python3 voice_forge.py speak --sid "$ovoice" --text "$(cat "$tf")" --out "build/$i.wav" >/dev/null
+  else
+    piper --model "$VOICEDIR/$voice.onnx" --output_file "build/$i.wav" < "$tf"
+  fi
   local dur; dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "build/$i.wav")
 
   local bgargs=(-f lavfi -i "color=c=$BG:s=\${W}x\${H}:d=$dur")
@@ -1181,7 +1739,7 @@ seg () { # seg <idx> <NAME> <colorhex> <voice> <sid> ; reads text from build/<id
     const eof='GP_EOF_'+i;
     const wrapw = t.sid ? 48 : 74;
     sh += `cat > build/${i}.txt <<'${eof}'\n${fold(t.text,wrapw)}\n${eof}\n`;
-    sh += `seg ${i} '${shq(sanName(t.name))}' ${t.hex||'0xf8f8f2'} '${shq(t.voice||'en_US-lessac-medium')}' '${shq(t.sid||'')}'\n\n`;
+    sh += `seg ${i} '${shq(sanName(t.name))}' ${t.hex||'0xf8f8f2'} '${shq(t.voice||'en_US-lessac-medium')}' '${shq(t.sid||'')}' '${shq(t.ovoice||t.sid||'')}'\n\n`;
   });
   sh += `ffmpeg -y -v error -f concat -safe 0 -i build/concat.txt -c copy episode.mp4
 echo "=========================================="
@@ -1198,9 +1756,10 @@ async function renderEpisode(){
   $('renderResult').innerHTML = '';
   log('render: starting ('+S.transcript.length+' segments)…');
   try{
-    const segments = S.transcript.map(t=>({sid:t.sid, name:t.name, text:t.text, voice:t.voice||'en_US-lessac-medium', hex:t.hex||'0xf8f8f2'}));
+    const segments = S.transcript.map(t=>({sid:t.sid, name:t.name, text:t.text,
+      voice:t.voice||'en_US-lessac-medium', ovoice:t.ovoice||t.sid||'', hex:t.hex||'0xf8f8f2'}));
     const r = await fetch('/api/render',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({segments, format:S.format})});
+      body:JSON.stringify({segments, format:S.format, engine:ttsEngine()})});
     const j = await r.json();
     if (!j.ok) throw new Error(j.error);
     log('render: done -> '+j.file+' ('+j.size_mb+' MB)');
@@ -1358,6 +1917,9 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBio(); 
     log(`topic bank loaded: ${TOPICS.length} theses (${TOPICS.filter(t=>t.cat==='serious').length} serious / ${TOPICS.filter(t=>t.cat==='absurd').length} absurd)`);
   }catch(e){ log('topic bank unavailable: '+e.message); }
   await loadCharacterMeta();
+  await loadHiredCast();
+  await loadVoiceprints();
+  if (!OVOICES.length) $('ttsEngine').value = 'piper';   // nothing designed yet — don't promise what we can't do
   loadCast();
   loadModels();
   log('GHOST PROTOCOL studio online.');
@@ -1375,6 +1937,7 @@ if __name__ == "__main__":
   ║        THE GHOST PROTOCOL // studio            ║
   ║   open  ->  http://localhost:{PORT}             ║
   ║   bind: {BIND}  (GP_BIND=0.0.0.0 for LAN)
+  ║   show: {SHOW_DIR or '(none — built-in cast; set GP_SHOW_DIR)'}
   ║   endpoint: {DEFAULT_ENDPOINT}
   ║   (change in UI, or GP_ENDPOINT / GP_API_KEY)  ║
   ╚════════════════════════════════════════════════╝

@@ -1,0 +1,14 @@
+{
+  "sid": "inkwell",
+  "name": "INKWELL",
+  "kind": "crew",
+  "version": "1.0.0",
+  "role": "Head writer",
+  "department": "writers-room",
+  "model_policy": "free/open models only (guild bylaw 3)",
+  "produces": "beatsheet.md — beats, planned collisions, callback slots, cold open.",
+  "tags": [
+    "writers-room",
+    "head"
+  ]
+}

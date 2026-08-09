@@ -1,0 +1,56 @@
+{
+  "alpha": {
+    "name": "SUBROUTINE_ALPHA",
+    "kind": "actor",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "beta": {
+    "name": "SUBROUTINE_BETA",
+    "kind": "actor",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "kernel": {
+    "name": "SYSTEM_KERNEL",
+    "kind": "actor",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "p7": {
+    "name": "PROTOCOL-7",
+    "kind": "actor",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "mira": {
+    "name": "M.I.R-A",
+    "kind": "actor",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "cynic": {
+    "name": "CYNIC.EXE",
+    "kind": "actor",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "splice": {
+    "name": "SPLICE",
+    "kind": "cre",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "inkwell": {
+    "name": "INKWELL",
+    "kind": "cre",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  },
+  "canon-lock": {
+    "name": "CANON.LOCK",
+    "kind": "cre",
+    "version": "1.0.0",
+    "guild": "/home/katalyst/repos/agentic-actors-guild"
+  }
+}

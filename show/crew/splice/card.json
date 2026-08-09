@@ -1,0 +1,14 @@
+{
+  "sid": "splice",
+  "name": "SPLICE",
+  "kind": "crew",
+  "version": "1.0.0",
+  "role": "Editor",
+  "department": "post",
+  "model_policy": "free/open models only (guild bylaw 3)",
+  "produces": "The locked cut of the transcript.",
+  "tags": [
+    "post",
+    "editor"
+  ]
+}

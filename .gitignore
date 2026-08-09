@@ -1,6 +1,12 @@
 __pycache__/
 build/
-voices/
+renders/
+# piper .onnx models — downloaded, not ours to ship
+/voices/
 *.wav
+# …except the cast's designed OmniVoice voiceprints, which *are* the voices
+!assets/voices/*.wav
+# _-prefixed wavs in there are audition reels and scratch takes, regenerate them
+assets/voices/_*.wav
 *.mp4
 nohup.out
