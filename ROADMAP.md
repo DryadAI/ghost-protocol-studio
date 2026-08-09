@@ -1,5 +1,7 @@
 # Roadmap
 
+This file tracks the engine repo only. The master plan across all repos (engine, Guild, template, flagship show) lives in [PLAN.md](PLAN.md).
+
 ## Now (before first upload)
 - [ ] First full episode rendered end-to-end on madhatter (Socratic, 4 rounds)
 - [ ] Verify Bifrost model mappings + pick default voices per speaker
