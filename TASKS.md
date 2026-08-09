@@ -13,7 +13,7 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Acceptance: with GP_SHOW_DIR=./show, run a Simulation episode — hired names/colors/prompts appear; editing a SOUL.md changes the next run
 - [x] Cross-check in a fresh show-template checkout (hire 2 actors, point engine at it)
 - [x] show-template: bump vendored engine, update README "Current wiring status" section, push
-- [ ] Merge, tag phase-1
+- [x] Merge, tag phase-1
 
 ## Phase 2 — Stage manager + bus (branch: p2-stage-manager)
 - [ ] Server-side episode runner: POST /api/episode/start {format, topic, rounds, cast, humans} creates `<show>/episodes/ep-NNN/`
