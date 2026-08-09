@@ -12,7 +12,7 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Format slotting: map hired members into format roles via card.json formats+role; casting picker in UI when >1 member qualifies for a slot
 - [x] Acceptance: with GP_SHOW_DIR=./show, run a Simulation episode — hired names/colors/prompts appear; editing a SOUL.md changes the next run
 - [x] Cross-check in a fresh show-template checkout (hire 2 actors, point engine at it)
-- [ ] show-template: bump vendored engine, update README "Current wiring status" section, push
+- [x] show-template: bump vendored engine, update README "Current wiring status" section, push
 - [ ] Merge, tag phase-1
 
 ## Phase 2 — Stage manager + bus (branch: p2-stage-manager)
