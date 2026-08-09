@@ -3,7 +3,7 @@
 **Archetype:** Utilitarian
 **Format(s):** Triad Synthesis
 **Role:** Philosopher
-**Voice:** en_US-amy-medium · **Model:** ollama/gemma3:4b
+**Voice:** `omnivoice/util` — middle-aged korean female, moderate pitch (piper fallback: en_US-amy-medium) · **Model:** ollama/gemma3:4b
 
 ---
 

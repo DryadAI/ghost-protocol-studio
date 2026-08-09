@@ -3,7 +3,7 @@
 **Archetype:** Skeptic
 **Format(s):** Round Table
 **Role:** Panelist
-**Voice:** en_GB-northern_english_male-medium · **Model:** ollama/wizard-vicuna-uncensored:13b
+**Voice:** `omnivoice/cynic` — elderly australian male, low pitch (piper fallback: en_GB-northern_english_male-medium) · **Model:** ollama/wizard-vicuna-uncensored:13b
 
 ---
 

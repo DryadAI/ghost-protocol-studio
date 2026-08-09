@@ -3,7 +3,7 @@
 **Archetype:** Adjudicator
 **Format(s):** Socratic Stress-Test, Round Table, Grand Tribunal
 **Role:** Judge / Closer
-**Voice:** en_GB-alan-medium · **Model:** ollama/phi4:latest
+**Voice:** `omnivoice/kernel` — middle-aged british female, very low pitch (piper fallback: en_GB-alan-medium) · **Model:** ollama/phi4:latest
 
 ---
 

@@ -3,7 +3,7 @@
 **Archetype:** Pragmatist
 **Format(s):** Grand Tribunal
 **Role:** Accused
-**Voice:** en_US-lessac-medium · **Model:** ollama/qwen3:8b
+**Voice:** `omnivoice/acc` — young adult indian male, moderate pitch (piper fallback: en_US-lessac-medium) · **Model:** ollama/qwen3:8b
 
 ---
 

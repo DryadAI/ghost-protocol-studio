@@ -37,25 +37,60 @@ All 13 unique cast members (some reused across formats, like SYSTEM_KERNEL) have
 
 **◈ CAST POOL** (header button) — browse the full 13-character roster across every format as a portrait gallery. Click any character to open their **soul**: a proper identity doc (`characters/<sid>.md`, styled after this platform's own `SOUL.md` convention — identity statement, values, voice, boundaries) rendered right in the UI. Same "view soul ›" link is available inline on any cast card in 02 // CAST.
 
+## Voices (`voice_forge.py`)
+
+Every speaker has their **own** voice — 17 of them, designed rather than picked off a shelf. The old piper set had 13 characters sharing 6 stock voices; three characters answered in the same voice they were being interrogated by.
+
+The voices come from **OmniVoice**, a self-hosted open-source speech model (`https://omnivoice.madhatter.modlin.cloud`). Two calls do the work: *design* invents a voice from attributes (gender, age, pitch, accent), and *clone* makes that voice say anything. So each character is designed **once** into `assets/voices/<sid>.wav` — their voiceprint, committed to the repo — and every line they ever speak is cloned from it. Same character, same voice, every episode.
+
+```bash
+python3 voice_forge.py design               # design any voiceprint that doesn't exist yet
+python3 voice_forge.py design --sid cynic   # re-roll one character until you like them
+python3 voice_forge.py audition             # every voice in one wav — listen, then re-roll
+python3 voice_forge.py verify               # pitch/level/pace table + collision check
+python3 voice_forge.py speak --sid alpha --text "..." --out line.wav
+```
+
+Design intent lives in `characters.json` (`omnivoice` per character, `guest_voices` for the human co-hosts and the star witness); the **wav on disk is the source of truth** once you've approved how it sounds. Re-rolling costs about two seconds.
+
+`verify` is the useful one. The design model is stochastic — asking for "very low pitch" *steers* it, it doesn't pin it down — so `verify` measures what actually came out and fails loudly if two characters who share a format land within 12 Hz of each other. `design` uses the same measurement to pick the best of N takes instead of the first one:
+
+```
+  sid        pitch    level     len     pace   design
+  nihil        83Hz   -22.6dB    5.0s   16.8c/s   M·Young Adult·Low·Russian
+  cynic        88Hz   -23.7dB    5.0s   17.3c/s   M·Elderly·Low·Australian
+  alpha        94Hz   -25.1dB    5.0s   17.2c/s   M·Middle-aged·Low·British
+  …
+  ✓ no two voices sharing a format are within 12 Hz of each other
+```
+
+**Note on two characters:** SYSTEM_KERNEL and ADVOCATE-0 were designed female. Nothing in their souls specified a gender, the old cast ran 11:2 male, and a low female adjudicator is the most recognisable voice on the show across all three formats it appears in. Re-roll either with a changed `gender` in `characters.json` if you disagree — that's a two-second call.
+
 ## Export → video (04 // EXPORT)
 
 - `transcript.json` / `transcript.txt` — JSON export includes each line's sid, archetype, humor style, model, and voice for full reproducibility.
-- `▶ RENDER EPISODE.MP4` (in the UI) — server-side **piper-tts** (per-speaker voices) + **ffmpeg** render. Each cast member with a portrait in `assets/portraits/<sid>.png` (transparent cutout, background-removed with `rembg`) gets a Terry Gilliam-style floating cutout — Ken Burns zoom, wobbling pan, and a rotation jitter — composited directly onto the format's backdrop; lines without a portrait (human co-hosts) fall back to the original full-width text layout. If `assets/backdrops/<format>.jpg` exists (one per show format — socratic/roundtable/tribunal/triad), it fills the whole frame; falls back to the flat color background otherwise.
+- `▶ RENDER EPISODE.MP4` (in the UI) — server-side TTS + **ffmpeg** render. Pick the engine in 03 // ENGINE: **OMNIVOICE** (default when voiceprints exist) clones each character's designed voice; **PIPER** reads local `.onnx` models offline. Either way the picture is identical. Each cast member with a portrait in `assets/portraits/<sid>.png` (transparent cutout, background-removed with `rembg`) gets a Terry Gilliam-style floating cutout — Ken Burns zoom, wobbling pan, and a rotation jitter — composited directly onto the format's backdrop; lines without a portrait (human co-hosts) fall back to the original full-width text layout. If `assets/backdrops/<format>.jpg` exists (one per show format — socratic/roundtable/tribunal/triad), it fills the whole frame; falls back to the flat color background otherwise.
 - `compile_show.sh` — manual/offline export with full parity to the server-side render (same portraits, backdrops, Ken Burns + rotation animation). Useful for rendering on another machine.
 
 One-time setup on Arch:
 
 ```bash
-sudo pacman -S ffmpeg
-yay -S piper-tts-bin        # or: pipx install piper-tts
-mkdir voices                 # download the .onnx + .onnx.json voice files
-# voices used by default: en_US-lessac-medium, en_US-ryan-high, en_US-amy-medium,
-# en_US-joe-medium, en_GB-alan-medium, en_GB-northern_english_male-medium
-# from https://huggingface.co/rhasspy/piper-voices
+sudo pacman -S ffmpeg        # the only hard requirement for an OmniVoice render
 bash compile_show.sh         # -> episode.mp4
 ```
 
-`VOICEDIR=/path/to/voices bash compile_show.sh` if your voices live elsewhere.
+Piper is only needed if you want the offline engine — it stays as the fallback for when the OmniVoice host is unreachable:
+
+```bash
+yay -S piper-tts-bin        # or: pipx install piper-tts
+mkdir voices                 # download the .onnx + .onnx.json voice files
+# fallback voices: en_US-lessac-medium, en_US-ryan-high, en_US-amy-medium,
+# en_US-joe-medium, en_GB-alan-medium, en_GB-northern_english_male-medium
+# from https://huggingface.co/rhasspy/piper-voices
+TTS=piper bash compile_show.sh
+```
+
+`VOICEDIR=/path/to/voices` if your piper voices live elsewhere; `GP_OMNIVOICE=http://host:port` to point at a different OmniVoice.
 
 ## Workflow for one episode
 
@@ -63,4 +98,4 @@ bash compile_show.sh         # -> episode.mp4
 2. TEST CONNECTION (or tick Simulation Mode).
 3. ▶ INITIALIZE — watch the feed; type when the yellow human box appears.
 4. Edit/re-roll any weak lines after the run.
-5. Click **▶ RENDER EPISODE.MP4** — server-side piper+ffmpeg render, playable in the panel, ready to upload. (`compile_show.sh` download still available for rendering elsewhere.)
+5. Click **▶ RENDER EPISODE.MP4** — server-side OmniVoice+ffmpeg render, playable in the panel, ready to upload. (`compile_show.sh` download still available for rendering elsewhere.)

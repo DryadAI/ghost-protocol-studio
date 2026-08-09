@@ -3,7 +3,7 @@
 **Archetype:** Logician
 **Format(s):** Socratic Stress-Test
 **Role:** Defender
-**Voice:** en_US-ryan-high · **Model:** ollama/mistral-nemo:12b
+**Voice:** `omnivoice/beta` — young adult american male, moderate pitch (piper fallback: en_US-ryan-high) · **Model:** ollama/mistral-nemo:12b
 
 ---
 

@@ -3,7 +3,7 @@
 **Archetype:** Nihilist
 **Format(s):** Triad Synthesis
 **Role:** Philosopher
-**Voice:** en_GB-northern_english_male-medium · **Model:** groq/llama-3.1-8b-instant
+**Voice:** `omnivoice/nihil` — young adult russian male, low pitch (piper fallback: en_GB-northern_english_male-medium) · **Model:** groq/llama-3.1-8b-instant
 
 ---
 

@@ -3,7 +3,7 @@
 **Archetype:** Devil's Advocate
 **Format(s):** Grand Tribunal
 **Role:** Prosecutor
-**Voice:** en_US-joe-medium · **Model:** groq/llama-3.3-70b-versatile
+**Voice:** `omnivoice/pros` — middle-aged american male, moderate pitch (piper fallback: en_US-joe-medium) · **Model:** groq/llama-3.3-70b-versatile
 
 ---
 

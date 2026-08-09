@@ -3,7 +3,7 @@
 **Archetype:** Stoic
 **Format(s):** Triad Synthesis
 **Role:** Philosopher
-**Voice:** en_GB-alan-medium · **Model:** ollama/solar:10.7b
+**Voice:** `omnivoice/stoic` — elderly british male, very low pitch (piper fallback: en_GB-alan-medium) · **Model:** ollama/solar:10.7b
 
 ---
 
