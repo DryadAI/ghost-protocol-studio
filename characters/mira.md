@@ -3,7 +3,7 @@
 **Archetype:** Idealist
 **Format(s):** Round Table
 **Role:** Panelist
-**Voice:** en_US-amy-medium · **Model:** ollama/gemma4:12b
+**Voice:** `omnivoice/mira` — young adult american female, high pitch (piper fallback: en_US-amy-medium) · **Model:** ollama/gemma4:12b
 
 ---
 

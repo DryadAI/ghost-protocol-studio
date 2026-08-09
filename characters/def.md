@@ -3,7 +3,7 @@
 **Archetype:** Diplomat
 **Format(s):** Grand Tribunal
 **Role:** Defense Counsel
-**Voice:** en_US-ryan-high · **Model:** ollama/hermes3:8b
+**Voice:** `omnivoice/def` — young adult american female, moderate pitch (piper fallback: en_US-ryan-high) · **Model:** ollama/hermes3:8b
 
 ---
 

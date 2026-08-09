@@ -3,7 +3,7 @@
 **Archetype:** Synthesizer
 **Format(s):** Triad Synthesis
 **Role:** Synthesizer / Closer
-**Voice:** en_US-joe-medium · **Model:** ollama/qwen3:14b
+**Voice:** `omnivoice/synth` — middle-aged auto male, low pitch (piper fallback: en_US-joe-medium) · **Model:** ollama/qwen3:14b
 
 ---
 

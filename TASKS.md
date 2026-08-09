@@ -26,10 +26,10 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Merge, tag phase-2
 
 ## Phase 3.1 — SPLICE the editor (branch: p3-1-splice)
-- [ ] Post-run "editor pass": SPLICE (soul from `<show>/crew/splice/`) reads transcript, emits per-line cut proposals on the bus with one-word justifications
-- [ ] UI: proposals render as strikethroughs with approve/reject per cut; approved cuts produce the locked transcript used for export
-- [ ] Works in Simulation Mode (canned cut proposals)
-- [ ] Merge, tag phase-3.1
+- [x] Post-run "editor pass": SPLICE (soul from `<show>/crew/splice/`) reads transcript, emits per-line cut proposals on the bus with one-word justifications
+- [x] UI: proposals render as strikethroughs with approve/reject per cut; approved cuts produce the locked transcript used for export
+- [x] Works in Simulation Mode (canned cut proposals)
+- [x] Merge, tag phase-3.1
 
 ## Phase 3.2 — INKWELL the head writer (branch: p3-2-inkwell)
 - [ ] Pre-run pass: INKWELL reads episodes/ep-NNN/brief.md + `<show>/SERIES_BIBLE.md` → writes beatsheet.md (beats, planned collisions, callback slots, cold open)

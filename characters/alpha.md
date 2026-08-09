@@ -3,7 +3,7 @@
 **Archetype:** Interrogator
 **Format(s):** Socratic Stress-Test
 **Role:** Interrogator
-**Voice:** en_US-lessac-medium · **Model:** ollama/deepseek-r1:14b
+**Voice:** `omnivoice/alpha` — middle-aged british male, low pitch (piper fallback: en_US-lessac-medium) · **Model:** ollama/deepseek-r1:14b
 
 ---
 
