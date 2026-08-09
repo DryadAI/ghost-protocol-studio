@@ -35,7 +35,7 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Pre-run pass: INKWELL reads episodes/ep-NNN/brief.md + `<show>/SERIES_BIBLE.md` → writes beatsheet.md (beats, planned collisions, callback slots, cold open)
 - [x] Stage manager feeds the current beat into each turn's instruction
 - [x] UI: beat sheet visible during run; approval gate before the run starts (approval_request on the bus)
-- [ ] Merge, tag phase-3.2
+- [x] Merge, tag phase-3.2
 
 ## Phase 3.3 — CANON.LOCK the archivist (branch: p3-3-canon-lock)
 - [ ] Post-episode pass: CANON.LOCK reads locked transcript + each cast MEMORY.md → emits proposed MEMORY.md diffs (running gags, positions, grudges, notable lines) on the bus
