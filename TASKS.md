@@ -23,7 +23,7 @@ Dev show directory: `show/` in this repo (`GP_SHOW_DIR=./show`). It is the Phase
 - [x] Replay: GET /api/episode/<id>/bus loads any past episode read-only; transcript.json derived from bus
 - [x] Headless: `python3 ghost_protocol_studio.py --episode <id> --run` (works in Simulation Mode)
 - [x] Acceptance: kill browser mid-run, reopen, feed resumes; replay a finished episode; one headless Simulation run completes
-- [ ] Merge, tag phase-2
+- [x] Merge, tag phase-2
 
 ## Phase 3.1 — SPLICE the editor (branch: p3-1-splice)
 - [ ] Post-run "editor pass": SPLICE (soul from `<show>/crew/splice/`) reads transcript, emits per-line cut proposals on the bus with one-word justifications
