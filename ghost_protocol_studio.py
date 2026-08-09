@@ -1043,9 +1043,10 @@ def start_episode(body: dict) -> dict:
     cast = body.get("cast") or []
     if not cast:
         return {"ok": False, "error": "no cast"}
-    eid = next_episode_id()
-    path = os.path.join(EPISODES_DIR, eid)
-    os.makedirs(path, exist_ok=True)
+    with EPISODES_LOCK:      # two starts in the same second must not claim the same id
+        eid = next_episode_id()
+        path = os.path.join(EPISODES_DIR, eid)
+        os.makedirs(path, exist_ok=True)
     meta = {"id": eid, "format": fmt, "topic": topic, "rounds": int(body.get("rounds") or 4),
             "cast": cast, "humans": body.get("humans") or [], "sim": bool(body.get("sim")),
             "show": SHOW_DIR, "created": time.time(), "updated": time.time(), "state": "brief"}
