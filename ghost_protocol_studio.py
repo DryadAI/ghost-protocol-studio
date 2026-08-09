@@ -301,6 +301,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(TOPICS).encode("utf-8"))
         elif self.path == "/api/characters":
             self._send(200, "application/json", json.dumps(CHARACTERS).encode("utf-8"))
+        elif self.path.startswith("/api/characters/") and self.path.endswith("/bio"):
+            sid = self.path[len("/api/characters/"):-len("/bio")]
+            fpath = os.path.abspath(os.path.join(BASE_DIR, "characters", f"{sid}.md"))
+            if re.fullmatch(r"[a-zA-Z0-9_-]+", sid) and os.path.isfile(fpath):
+                with open(fpath, encoding="utf-8") as f:
+                    self._send(200, "text/markdown; charset=utf-8", f.read().encode("utf-8"))
+            else:
+                self._send(404, "text/plain", b"not found")
         elif self.path.startswith("/assets/"):
             rel = self.path[len("/assets/"):]
             fpath = os.path.abspath(os.path.join(BASE_DIR, "assets", rel))
@@ -453,6 +461,32 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
 .tourFoot button{background:var(--panel);border:1px solid var(--line);color:var(--fg);padding:5px 10px;font-family:inherit;font-size:11px;letter-spacing:1px;cursor:pointer;border-radius:3px}
 .tourFoot button:hover{border-color:var(--cyan);color:var(--cyan)}
 .tourFoot button:disabled{opacity:.35;cursor:not-allowed}
+/* ---------- cast pool + bio ---------- */
+#poolPanel{position:fixed;inset:56px 0 0 0;z-index:9980;background:var(--bg);overflow-y:auto;padding:20px 26px}
+#poolPanel.hide{display:none}
+#poolHead{font-size:12px;color:var(--dim);letter-spacing:1px;margin-bottom:16px;position:relative;padding-right:30px}
+#poolHead b{color:var(--cyan);letter-spacing:2px}
+#poolClose{position:absolute;top:-4px;right:0;background:none;border:none;color:var(--dim);font-size:16px;cursor:pointer}
+#poolClose:hover{color:var(--red)}
+#poolGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px}
+.poolCard{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:12px;cursor:pointer;text-align:center;transition:border-color .15s}
+.poolCard:hover{border-color:var(--cyan)}
+.poolCard img{width:88px;height:88px;border-radius:50%;object-fit:cover;object-position:top;margin-bottom:8px;background:var(--bg)}
+.poolCard b{display:block;font-size:11px;letter-spacing:1px;margin-bottom:3px}
+.poolCard .arch{font-size:9px;color:var(--dim);letter-spacing:1px}
+#bioBackdrop{position:fixed;inset:0;background:rgba(5,8,14,.72);z-index:9994;display:none}
+#bioModal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9995;width:min(560px,90vw);max-height:80vh;overflow-y:auto;background:var(--panel2);border:1px solid var(--cyan);border-radius:8px;padding:24px 28px;box-shadow:0 12px 40px rgba(0,0,0,.7);display:none}
+#bioClose{position:absolute;top:12px;right:14px;background:none;border:none;color:var(--dim);font-size:18px;cursor:pointer}
+#bioClose:hover{color:var(--red)}
+#bioContent h1{font-size:16px;letter-spacing:1px;color:var(--fg);margin-bottom:4px}
+#bioContent h2{font-size:11px;letter-spacing:2px;color:var(--cyan);border-bottom:1px dashed var(--line);padding-bottom:4px;margin:18px 0 8px}
+#bioContent blockquote{color:var(--yellow);font-style:italic;border-left:2px solid var(--yellow);padding-left:12px;margin:12px 0;font-size:13px}
+#bioContent p{font-size:12px;line-height:1.6;color:var(--fg);margin-bottom:10px}
+#bioContent ul{margin:0 0 10px 18px}
+#bioContent li{font-size:12px;line-height:1.6;color:var(--fg);margin-bottom:4px}
+#bioContent b{color:var(--fg)}
+#bioContent hr{border:none;border-top:1px solid var(--line);margin:14px 0}
+#bioContent em{color:var(--dim);font-size:11px}
 </style>
 </head>
 <body>
@@ -463,6 +497,7 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
   <button class="tog on" id="togCfg" onclick="$('cfg').classList.toggle('hide');this.classList.toggle('on')">CONFIG</button>
   <button class="tog on" id="togExp" onclick="$('right').classList.toggle('hide');$('right').classList.toggle('pin');this.classList.toggle('on')">EXPORT</button>
   <button class="tog" id="togTour" onclick="tourStart()">WALKTHROUGH</button>
+  <button class="tog" id="togPool" onclick="togglePool()">◈ CAST POOL</button>
   <span id="statusText">IDLE</span>
 </header>
 <main>
@@ -563,6 +598,18 @@ button.b:disabled{opacity:.35;cursor:not-allowed}
     </div>
   </div>
 </main>
+<div id="poolPanel" class="hide">
+  <div id="poolHead">
+    <b>◈ CAST POOL</b> — every character in the show, across every format. Click one for their soul.
+    <button id="poolClose" onclick="togglePool()">✕</button>
+  </div>
+  <div id="poolGrid"></div>
+</div>
+<div id="bioBackdrop" onclick="closeBio()"></div>
+<div id="bioModal">
+  <button id="bioClose" onclick="closeBio()">✕</button>
+  <div id="bioContent">loading…</div>
+</div>
 <div id="tourBackdrop"></div>
 <div id="tourCard">
   <button id="tourClose" onclick="tourClose()" title="close walkthrough">✕</button>
@@ -705,7 +752,7 @@ function renderCastList(){
   cast.forEach((c,i)=>{
     const d=document.createElement('div'); d.className='cast';
     const thumb = c.image ? `<img src="/${c.image}" style="width:36px;height:36px;border-radius:50%;object-fit:cover;object-position:top;border:1px solid ${c.color}">` : `<span class="dot" style="background:${c.color}"></span>`;
-    const archBadge = c.archetype ? `<div style="font-size:10px;color:${c.color};letter-spacing:1px;margin:-4px 0 8px">${esc(c.archetype).toUpperCase()}${c.humor?' · '+esc(c.humor):''}</div>` : '';
+    const archBadge = c.archetype ? `<div style="font-size:10px;color:${c.color};letter-spacing:1px;margin:-4px 0 8px">${esc(c.archetype).toUpperCase()}${c.humor?' · '+esc(c.humor):''} <span style="text-decoration:underline;cursor:pointer;color:var(--dim)" onclick="openBio('${c.sid}')">view soul ›</span></div>` : '';
     d.innerHTML = `
       <div class="head" onclick="this.parentNode.classList.toggle('open')">
         ${thumb}<b style="color:${c.color}">${esc(c.name)}</b><span class="car">▾</span>
@@ -1241,6 +1288,62 @@ function renderTourStep(){
 }
 window.addEventListener('resize', ()=>{ if (tourIdx>=0) tourPositionCard(tourLastEl?tourLastEl.getBoundingClientRect():null); });
 document.addEventListener('keydown', e=>{ if (e.key==='Escape' && tourIdx>=0) tourClose(); });
+
+/* ============================================================== cast pool + bio */
+function togglePool(){
+  const open = $('poolPanel').classList.toggle('hide') === false;
+  $('togPool').classList.toggle('on', open);
+  if (open) renderPool();
+}
+function renderPool(){
+  const list = Object.values(CHAR_META);
+  $('poolGrid').innerHTML = list.map(c => `
+    <div class="poolCard" onclick="openBio('${c.sid}')">
+      ${c.image ? `<img src="/${c.image}">` : ''}
+      <b style="color:${hexOf(c.color)}">${esc(c.name)}</b>
+      <div class="arch">${esc((c.archetype||'').toUpperCase())}</div>
+    </div>`).join('');
+}
+function hexOf(h){ return h && h.startsWith('#') ? h : (h||'#f8f8f2'); }
+/* tiny markdown -> HTML, just enough for our own bio files */
+function mdToHtml(md){
+  const lines = md.split('\n');
+  let html = '', inList = false;
+  const closeList = () => { if (inList){ html += '</ul>'; inList = false; } };
+  const inline = s => esc(s)
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>');
+  lines.forEach(line => {
+    if (/^---+$/.test(line.trim())){ closeList(); html += '<hr>'; return; }
+    if (line.startsWith('## ')){ closeList(); html += `<h2>${inline(line.slice(3))}</h2>`; return; }
+    if (line.startsWith('# ')){ closeList(); html += `<h1>${inline(line.slice(2))}</h1>`; return; }
+    if (line.startsWith('> ')){ closeList(); html += `<blockquote>${inline(line.slice(2))}</blockquote>`; return; }
+    if (line.startsWith('- ')){ if(!inList){ html += '<ul>'; inList = true; } html += `<li>${inline(line.slice(2))}</li>`; return; }
+    closeList();
+    if (line.trim()) html += `<p>${inline(line)}</p>`;
+  });
+  closeList();
+  return html;
+}
+async function openBio(sid){
+  $('bioBackdrop').style.display = 'block';
+  $('bioModal').style.display = 'block';
+  $('bioContent').innerHTML = 'loading…';
+  try{
+    const r = await fetch(`/api/characters/${encodeURIComponent(sid)}/bio`);
+    if (!r.ok) throw new Error('no bio on file for this character');
+    const md = await r.text();
+    $('bioContent').innerHTML = mdToHtml(md);
+  }catch(e){
+    $('bioContent').innerHTML = `<p>Couldn't load this character's soul: ${esc(e.message)}</p>`;
+  }
+}
+function closeBio(){
+  $('bioBackdrop').style.display = 'none';
+  $('bioModal').style.display = 'none';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBio(); });
 
 /* ============================================================== boot */
 (async function(){

@@ -35,6 +35,8 @@ Every cast member's name, system prompt, model override, and Piper voice is edit
 
 All 13 unique cast members (some reused across formats, like SYSTEM_KERNEL) have a full profile in `characters.json`: a debate archetype (Interrogator, Logician, Skeptic, Synthesizer, ...), a distinct comedic voice, a transparent cutout portrait, and — the big one — **a genuinely unique AI model each**, pulled only from what's actually working through Bifrost right now (Ollama + Groq; `vllm/*` is deliberately excluded — see CLAUDE.md, it's paid-subscription-backed and "not a default for any agent"). The app fetches this at boot (`/api/characters`) and pre-fills each cast card's MODEL OVERRIDE, portrait thumbnail, and archetype badge — still fully editable per-run in 02 // CAST. `characters.json` is the design-intent source of truth; `CASTS` in the app is what actually runs, kept in sync by hand.
 
+**◈ CAST POOL** (header button) — browse the full 13-character roster across every format as a portrait gallery. Click any character to open their **soul**: a proper identity doc (`characters/<sid>.md`, styled after this platform's own `SOUL.md` convention — identity statement, values, voice, boundaries) rendered right in the UI. Same "view soul ›" link is available inline on any cast card in 02 // CAST.
+
 ## Export → video (04 // EXPORT)
 
 - `transcript.json` / `transcript.txt` — JSON export includes each line's sid, archetype, humor style, model, and voice for full reproducibility.
